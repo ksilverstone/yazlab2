@@ -1,0 +1,43 @@
+experiment:
+  random_seeds: [42, 123, 2026, 7, 999]
+  log_dir: "logs"
+  output_json_path: "logs/decisions.json"
+
+data:
+  skab:
+    raw_dir: "data/raw/SKAB"
+    processed_dir: "data/processed/SKAB"
+    group_col: "source_file"
+  batadal:
+    file_path: "data/raw/BATADAL/Training_Dataset_2.csv"
+    processed_dir: "data/processed/BATADAL"
+    train_ratio: 0.6
+    val_ratio: 0.2
+    test_ratio: 0.2
+
+preprocessing:
+  scaler: "StandardScaler"
+  pca_n_components: 1
+
+deep_learning:
+  max_epochs: 50
+  batch_size: 32
+  learning_rate: 0.001
+  early_stopping_patience: 5
+  models:
+    lstm:
+      input_size: -1 # Veri setine göre dinamik olarak dolacak
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.2
+    cnn_1d:
+      in_channels: -1 # Veri setine göre dinamik olarak dolacak
+      out_channels: 64
+      kernel_size: 3
+      dropout: 0.2
+
+automata:
+  paa_size: 4
+  sax_alphabet_size: 3
+  window_size: 4
+  levenshtein_threshold: 2 # Unseen pattern'lar için max distance vs ayarı eklenebilir
