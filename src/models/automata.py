@@ -76,3 +76,29 @@ class AutomataModel:
             patterns.append(pattern)
             
         return patterns
+
+    def fit(self, sax_string_train: str):
+        """Eğitim verisinden Frekans Tabanlı Geçiş Olasılık Matrisi (TPM) oluşturur."""
+        patterns = self._extract_patterns(sax_string_train)
+        counts = {}
+        
+        # Ardışık pattern'lar arası geçişleri (transition) say
+        for i in range(len(patterns) - 1):
+            curr_state = patterns[i]
+            next_state = patterns[i + 1]
+            
+            if curr_state not in counts:
+                counts[curr_state] = {}
+            if next_state not in counts[curr_state]:
+                counts[curr_state][next_state] = 0
+                
+            counts[curr_state][next_state] += 1
+            
+        # Olasılıkları hesapla ve transition_matrix'e kaydet
+        for curr_state, transitions in counts.items():
+            total_transitions = sum(transitions.values())
+            self.transition_matrix[curr_state] = {}
+            
+            for next_state, count in transitions.items():
+                prob = count / total_transitions
+                self.transition_matrix[curr_state][next_state] = prob
