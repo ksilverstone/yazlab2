@@ -51,5 +51,28 @@ class TimeSeriesSymbolizer:
         # İndeksleri ASCII karakterlerine çevir: 0 -> 'a' (ASCII 97), 1 -> 'b', vs.
         symbols = [chr(97 + i) for i in indices]
         
-        # Sembolleri birleştirip tek bir string olarak dön
         return "".join(symbols)
+
+
+class AutomataModel:
+    """SAX sembol dizilerinden durum (state) çıkarımı ve olasılıksal matris inşası için sınıf."""
+    
+    def __init__(self, window_size: int = 4):
+        self.window_size = window_size
+        self.transition_matrix = {}
+        
+    def _extract_patterns(self, sax_string: str) -> list:
+        """Uzun SAX karakter dizisini window_size uzunluğunda kayan pencerelere (pattern) böler."""
+        patterns = []
+        n = len(sax_string)
+        
+        # window_size'dan daha kısa bir string gelirse hata oluşmasını engeller
+        if n < self.window_size:
+            return patterns
+            
+        # Kayan pencere (Sliding Window) mantığı ile adım adım (step=1) ilerleyerek pattern oluştur
+        for i in range(n - self.window_size + 1):
+            pattern = sax_string[i : i + self.window_size]
+            patterns.append(pattern)
+            
+        return patterns
