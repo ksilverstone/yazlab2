@@ -134,7 +134,7 @@ class AutomataModel:
         nearest_pattern = None
         min_distance = float('inf')
         
-        for known_state in self.known_states:
+        for known_state in sorted(self.known_states):
             dist = self._levenshtein_distance(unseen_pattern, known_state)
             if dist < min_distance:
                 min_distance = dist
