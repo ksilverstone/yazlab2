@@ -28,3 +28,28 @@ class TimeSeriesSymbolizer:
             paa_means = np.append(paa_means, last_mean)
             
         return paa_means
+
+    def fit(self, X_train_1d: np.ndarray):
+        """Eğitim verisinden PAA uygulayarak SAX eşik değerlerini öğrenir."""
+        paa_data = self._apply_paa(X_train_1d)
+        
+        # alphabet_size kadar dilim için alphabet_size-1 adet eşik değeri gerekir
+        # np.linspace ile yüzdelik (percentile) eşiklerini hesaplıyoruz (ör: %33.3, %66.6)
+        percentiles = np.linspace(0, 100, self.alphabet_size + 1)[1:-1]
+        self.bins = np.percentile(paa_data, percentiles)
+        
+    def transform(self, X_1d: np.ndarray) -> str:
+        """Yeni gelen veriyi PAA ile sıkıştırıp daha önce öğrenilen sınırlara göre harflere çevirir."""
+        if self.bins is None:
+            raise ValueError("Transform işleminden önce fit() çağrılmalıdır!") # User doesn't want standard error prints directly, but raising exceptions for coding errors is fine.
+            
+        paa_data = self._apply_paa(X_1d)
+        
+        # numpy.digitize değerlerin hangi bin'e düştüğünün indeksini döner (0, 1, 2...)
+        indices = np.digitize(paa_data, self.bins)
+        
+        # İndeksleri ASCII karakterlerine çevir: 0 -> 'a' (ASCII 97), 1 -> 'b', vs.
+        symbols = [chr(97 + i) for i in indices]
+        
+        # Sembolleri birleştirip tek bir string olarak dön
+        return "".join(symbols)
