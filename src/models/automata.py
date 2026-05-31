@@ -60,6 +60,7 @@ class AutomataModel:
     def __init__(self, window_size: int = 4):
         self.window_size = window_size
         self.transition_matrix = {}
+        self.known_states = set()
         
     def _extract_patterns(self, sax_string: str) -> list:
         """Uzun SAX karakter dizisini window_size uzunluğunda kayan pencerelere (pattern) böler."""
@@ -102,3 +103,41 @@ class AutomataModel:
             for next_state, count in transitions.items():
                 prob = count / total_transitions
                 self.transition_matrix[curr_state][next_state] = prob
+                
+        # Eğitilen tüm durumları kaydet (Unseen pattern eşlemesi için gerekli)
+        self.known_states = set(patterns)
+
+    def _levenshtein_distance(self, s1: str, s2: str) -> int:
+        """Dinamik Programlama (DP) ile iki string arasındaki Minimum Edit Distance'ı hesaplar."""
+        m, n = len(s1), len(s2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        for i in range(m + 1):
+            for j in range(n + 1):
+                if i == 0:
+                    dp[i][j] = j
+                elif j == 0:
+                    dp[i][j] = i
+                elif s1[i - 1] == s2[j - 1]:
+                    dp[i][j] = dp[i - 1][j - 1]
+                else:
+                    dp[i][j] = 1 + min(dp[i - 1][j],      # Silme
+                                       dp[i][j - 1],      # Ekleme
+                                       dp[i - 1][j - 1])  # Değiştirme
+        return dp[m][n]
+
+    def _map_unseen_pattern(self, unseen_pattern: str) -> tuple:
+        """Görülmemiş bir pattern'ı bilinen durumlara en yakın (min Levenshtein mesafeli) olanla eşler."""
+        if not self.known_states:
+            return None, float('inf')
+            
+        nearest_pattern = None
+        min_distance = float('inf')
+        
+        for known_state in self.known_states:
+            dist = self._levenshtein_distance(unseen_pattern, known_state)
+            if dist < min_distance:
+                min_distance = dist
+                nearest_pattern = known_state
+                
+        return nearest_pattern, min_distance
