@@ -134,10 +134,69 @@ class AutomataModel:
         nearest_pattern = None
         min_distance = float('inf')
         
-        for known_state in sorted(self.known_states):
+        for known_state in self.known_states:
             dist = self._levenshtein_distance(unseen_pattern, known_state)
             if dist < min_distance:
                 min_distance = dist
                 nearest_pattern = known_state
                 
         return nearest_pattern, min_distance
+
+    def predict_and_explain(self, test_sax_string: str, anomaly_threshold: float = 0.05) -> list:
+        """
+        Test verisi üzerinde dolaşarak adım adım geçiş olasılıklarını hesaplar
+        ve JSON formatında açıklanabilir (explainable) sonuçlar üretir.
+        """
+        patterns = self._extract_patterns(test_sax_string)
+        results = []
+        
+        epsilon = 1e-5
+        log_path_prob = 0.0
+        
+        for i in range(len(patterns)):
+            raw_pattern = patterns[i]
+            
+            # 1. Durum Kontrolü ve Haritalama (Mapping)
+            if raw_pattern in self.known_states:
+                status = "seen"
+                mapped_to = None
+                current_state = raw_pattern
+            else:
+                status = "unseen"
+                mapped_to, _ = self._map_unseen_pattern(raw_pattern)
+                current_state = mapped_to
+                
+            # 2. Geçiş Olasılığı (Transition Probability) Hesabı
+            prob = epsilon
+            if i < len(patterns) - 1:
+                next_raw = patterns[i + 1]
+                
+                # Bir sonraki state'in de bilinip bilinmediğini kontrol et
+                next_state = next_raw if next_raw in self.known_states else self._map_unseen_pattern(next_raw)[0]
+                
+                # TPM matrisinden geçiş olasılığını oku, yoksa epsilon al
+                if current_state in self.transition_matrix:
+                    prob = self.transition_matrix[current_state].get(next_state, epsilon)
+            else:
+                # Son elemanın bir sonrakisi olmadığı için olasılık nötr sayılır
+                prob = 1.0
+                
+            # Kümülatif Path Probability için logaritma toplamı (Underflow engellemek adına)
+            log_path_prob += np.log(prob)
+            
+            # 3. Anomali Kararı (Olasılık threshold'un altındaysa)
+            decision = "anomaly" if prob < anomaly_threshold else "normal"
+            
+            # Zorunlu tutulan JSON Dict formatı
+            step_result = {
+                "time_step": i,
+                "state": current_state,
+                "pattern": raw_pattern,
+                "status": status,
+                "mapped_to": mapped_to,
+                "probability": float(prob),
+                "decision": decision
+            }
+            results.append(step_result)
+            
+        return results
