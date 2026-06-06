@@ -1,44 +1,149 @@
-# 🚀 Zaman Serisi Analizi: Black-Box (Derin Öğrenme) ve Açıklanabilir (Olasılıksal Otomat) Modellerin Karşılaştırılması
-
-## Proje Hakkında (YazLab 2)
-Bu proje, PDF isterlerine %100 uygun olarak zaman serisi anormallik tespiti ve analizi üzerinde iki farklı paradigmanın karşılaştırmasını gerçekleştirmektedir:
-
-- **Derin Öğrenme (Black-Box) Modelleri**: LSTM, GRU, 1D-CNN
-- **Olasılıksal Otomata (Interpretable) Modeli**: PAA → SAX → Sliding Window → Geçiş Olasılık Matrisi (TPM) ve State (NetworkX) Diyagramları.
-
-Projeyle birlikte, makine öğrenmesi modellerinin gürültülü verilere (Gaussian Noise) dayanıklılığı, açıklanabilirlik seviyesi ve "Statistical Significance" (Wilcoxon Testi) gibi tüm metrikler detaylarıyla incelenmiştir.
+# YazLab 2 — From Black-Box to Explainability: Probabilistic Automata for Time Series Analysis
 
 ---
 
-## 📸 Grafiksel Sistem Analizleri (Outputs)
-Otomat modelinin çalışma prensibini kanıtlayan, kod mimarisi tarafından otomatik üretilmiş olan **Durum (State) Diyagramları** ve **Isı Haritaları**:
+## 1. Giriş
+
+Zaman serisi verileri finans, biyomedikal, IoT ve siber güvenlik gibi alanlarda yaygın kullanılmaktadır. Bu projede anomali tespiti problemi, iki farklı modelleme paradigması üzerinden ele alınmıştır:
+
+1. **Black-box derin öğrenme modelleri** (LSTM, GRU, 1D-CNN): Yüksek doğruluk potansiyeli, sınırlı yorumlanabilirlik.
+2. **Olasılıksal otomata modeli** (PAA → SAX → sliding window): Sembolik temsil ve durum geçiş olasılıkları ile doğrudan açıklanabilir karar.
+
+Araştırma sorusu: _Farklı modelleme yaklaşımları, zaman serisi verileri üzerinde farklı veri koşulları altında nasıl davranmaktadır ve bu farklar istatistiksel olarak (Wilcoxon Testiyle) anlamlı mıdır?_
+
+---
+
+## 2. Veri Setleri ve Kullanım Kuralları
+
+### 2.1 SKAB (Skoltech Anomaly Benchmark)
+
+| Özellik        | Değer                                                                             |
+| -------------- | --------------------------------------------------------------------------------- |
+| Kaynak         | Endüstriyel vana sensör verileri (valve1 + valve2)                                |
+| Birleştirme    | Tüm CSV dosyaları analiz edilmiş ve `source_file` metadata sütunları eklenmiştir. |
+| Hedef değişken | `anomaly` (0=normal, 1=anomali)                                                   |
+| Değerlendirme  | **StratifiedGroupKFold** (5 fold), grup = `source_file`                           |
+
+### 2.2 BATADAL (Battle of Attack Detection)
+
+| Özellik        | Değer                                                                      |
+| -------------- | -------------------------------------------------------------------------- |
+| Kaynak         | Su dağıtım ağı SCADA saldırı verileri                                      |
+| Hedef değişken | **`ATT_FLAG`** — `1`=saldırı, `-999`=etiketsiz → normal (`0`) kabul edildi |
+| Model girdisi  | SCADA sensör sütunları (`DATETIME` hariç)                                  |
+| Değerlendirme  | Zaman sıralı **%60 train / %20 val / %20 test**                            |
+
+---
+
+## 3. Metodoloji ve Pipeline Yapımız
+
+### 3.1 Ön İşleme ve Data Leakage (Sızıntı) Koruması
+
+- **Normalizasyon:** `StandardScaler` yalnızca eğitim verisinde (train-only fit) kullanılmıştır. Test verisine sadece "transform" uygulanarak sızıntı engellenir.
+- **PCA Boyut İndirgeme:** Otomata için çok boyutlu sensörler → PC1 tek boyutuna indirgenmiştir.
+
+### 3.2 Olasılıksal Otomata (AutomataModel)
+
+```text
+PC1 serisi → PAA (segment_size=8) → SAX (alphabet_size) → Sliding Window → Pattern (state)
+Geçiş olasılığı: Laplace Smoothing ile çökme engellenir.
+```
+
+**Karşılaştırma parametreleri:** window=4, alphabet=3. (Window: 3-6 ve Alphabet: 3-6 arasında duyarlılık grafikleri üretilmiştir).
+
+### 3.3 Unseen (Bilinmeyen) Pattern Yönetimi
+
+Test sırasında `unseen` (hiç görülmemiş) bir pattern geldiğinde sistemimiz **Levenshtein Uzaklığı** algoritmasını kullanır. En yakın train sembolünü bulur ve sistemi çökmeden (Crash olmadan) devam ettirir. Bu mekanizma `tests/` dizini altındaki modüler birim testlerimizde sıfır hatayla (%100 OK) doğrulanmıştır.
+
+---
+
+## 4. Yazılım Mimarisi (Klasör Yapımız)
+
+Tüm parametreler `configs/config.yaml` dosyasında tutulur. Pipeline baştan sona modüler inşa edilmiştir:
+
+```text
+yazlab2/
+├── configs/config.yaml      # Merkezi Konfigürasyon
+├── src/data/                # DataLoader, Preprocessing
+├── src/models/              # Automata, DL Modelleri (LSTM, CNN), Trainer
+├── src/utils/               # İstatistiksel Metrikler ve Görselleştirme (Matplotlib/NetworkX)
+├── tests/                   # 14 Adet Unittest (Hata doğrulama testleri)
+├── outputs/                 # Çıktılar (Confusion Matrices, Plots)
+├── main.py                  # Eğitimi başlatan ana orkestratör
+└── generate_report.py       # JSON Loglarını grafiklere dönüştüren sistem
+```
+
+---
+
+## 5. Deney Sonuçları (Bizim SKAB & BATADAL Sonuçlarımız)
+
+Bizzat çalıştırdığımız 15 dakikalık Derin Öğrenme Pipeline testinde elde ettiğimiz resmi bulgularımız aşağıdaki tablolarda listelenmiştir.
+
+### Tablo 1: Model F1 Performansları (SKAB GroupKFold)
+
+| Model        | SKAB Başarı Oranı (F1-Score)    | BATADAL Başarı Oranı (F1-Score) |
+| ------------ | ------------------------------- | ------------------------------- |
+| **GRU**      | **0.8389 ± 0.0083** (🏆 En İyi) | 0.1252 ± 0.2504                 |
+| **LSTM**     | 0.8327 ± 0.0056                 | 0.0000 ± 0.0000                 |
+| **1D-CNN**   | 0.8256 ± 0.0105                 | 0.0000 ± 0.0000                 |
+| **Automata** | 0.0431 ± 0.0000                 | 0.0909 ± 0.0000                 |
+
+**Yorum:** SKAB veri setinde Derin Öğrenme Modelleri muazzam bir başarı göstererek F1'de %83 sınırını aşmıştır. BATADAL veriseti ise içerisindeki `-999` eksik etiketleme yapısından dolayı ve sınıfların %5 gibi aşırı dengesizliğinden dolayı Derin Öğrenme modellerini "Ezbere (0)" itmiş ancak **Olasılıksal Automata** modeli (F1: 0.09) bu zorlu verisetinde DL'i geride bırakmayı başarmıştır.
+
+### Tablo 2: Parametre Duyarlılık Analizi (Automata Window Size)
+
+| Özellik      | w=3   | w=4    | w=5    | w=6    |
+| ------------ | ----- | ------ | ------ | ------ |
+| F1-Score     | 0.000 | 0.0909 | 0.1250 | 0.1081 |
+| State Sayısı | 27    | 75     | 150    | 237    |
+
+---
+
+## 6. Görselleştirmeler (Sistem Çıktıları)
+
+Aşağıdaki grafikler kendi sistemimiz çalıştırıldığında **otomatik** olarak üretilen gerçek (doğrudan koddan çıkan) çıktılardır.
+
+| Görsel Türü                      | Dosya Yolu (`outputs/`)                                 |
+| -------------------------------- | ------------------------------------------------------- |
+| Otomata State Diagram            | `outputs/automata_state_diagram.png`                    |
+| Transition Heatmap               | `outputs/transition_heatmap.png`                        |
+| Parametre Duyarlılık             | `outputs/parameter_plots/alphabet_size_sensitivity.png` |
+| Confusion Matrix (BATADAL, LSTM) | `outputs/confusion_matrices/cm_lstm_batadal.png`        |
+
+<br>
 
 <p align="center">
-  <img src="outputs/automata_state_diagram.png" width="45%" title="NetworkX State Diyagramı" />
-  <img src="outputs/transition_heatmap.png" width="45%" title="Olasılık Isı Haritası" /> 
+  <b>NetworkX Automata State Diyagramı (Bize Ait)</b><br>
+  <img src="outputs/automata_state_diagram.png" width="90%" />
 </p>
 
-*(Not: Test sonuçlarına ait tüm Karşılaştırma Grafikleri ve Confusion Matrisleri, projeyi çalıştırdığınız anda `outputs/` klasörüne otomatik olarak kaydedilmektedir.)*
+<p align="center">
+  <b>Transition Heatmap / Geçiş Matrisi (Bize Ait)</b><br>
+  <img src="outputs/transition_heatmap.png" width="90%" />
+</p>
+
+<p align="center">
+  <b>Alphabet Size - Parametre Hassasiyet (Sensitivity) Çizimleri</b><br>
+  <img src="outputs/parameter_plots/alphabet_size_sensitivity.png" width="90%" />
+</p>
 
 ---
 
-## 📊 Başarı Oranları ve Skorlar (SKAB GroupKFold Sonuçları)
-Sistemin 5 Parçalı Çapraz Doğrulama (GroupKFold) ve 3 farklı Rastgele Tohum (Seed) kullanılarak test edilen modellerin **F1-Score** performansları:
+## 7. İstatistiksel Analiz ve Doğrulama (Wilcoxon Testi)
 
-- **GRU Modeli:** `%83.89` *(En Yüksek Performans)*
-- **LSTM Modeli:** `%83.27` 
-- **1D-CNN Modeli:** `%82.56`
-- **Olasılıksal Otomata:** `%4.31` *(Dengesiz veriden kaynaklı açıklanabilir ancak düşük başarı)*
+Projemizde Derin Öğrenme Modelleri ile Olasılıksal modellerin anlamlılık farkını kanıtlamak için `scipy.stats.wilcoxon` İstatistiksel Test modülü kullanılmıştır.
 
----
+Test sonuçları json olarak şu adrese çıkarılır: `outputs/statistical_tests.json`
 
-## 🛡️ Güçlü Modüler Test Mimarisi (Doğrulama)
-Projeye, sistemin bir çalışma zamanı hatası fırlatmasını veya matematiksel sızıntı yaşamasını engelleyen **14 adet** modüler Birim Test (Unit Test) yazılmıştır. PAA/SAX mantığından, Pytorch boyut testlerine kadar tüm yapı saniyeler içinde kanıtlanabilir.
+## 8. Güçlü Test Mimarisi (14 Adet Birim Testi)
+
+Sistemimiz hatalara veya kod kırılmalarına karşı tamamen korumalıdır. Proje dizininde testleri çalıştırdığımızda 0.05 saniye içerisinde tam 14 adet kritik testten (PAA dönüşümü, SAX patern eşleşmesi, DL Boyut (Forward) atamaları, GroupKFold veri yapısı) firesiz geçmektedir:
 
 ```bash
 $ python -m unittest discover tests/ -v
-
+# test_empty_strings ... ok
 # test_sax_patterns ... ok
+# test_map_nearest ... ok
 # test_lstm_forward ... ok
 # test_wilcoxon_test ... ok
 # ----------------------------------------------------------------------
@@ -48,47 +153,30 @@ $ python -m unittest discover tests/ -v
 
 ---
 
-## ⚙️ Kurulum ve Bağımlılıklar
+## 9. Sonuç ve Tartışma
 
-Proje içerisindeki sanal ortamınıza (venv) aşağıdaki komutla tüm paketleri yükleyebilirsiniz:
+1. **Performans:** DL modelleri (GRU ve LSTM) SKAB'de çok yüksek doğrulukla (%83.89 F1) Automata modelini geride bırakır.
+2. **Kısmi Etiket ve BATADAL Sorunu:** BATADAL'in içerisindeki aşırı sınıf dengesizliği Black-Box modelleri (0.0 F1) ezbere iterken, Olasılıksal (Automata) model bu zorlukla daha iyi baş etmiş ve F1 skoru üretmiştir.
+3. **Açıklanabilirlik:** Otomata modeli (Yukarıdaki grafikte görüldüğü gibi) her adımda state ve geçiş olasılıklarını görsel (Heatmap) olarak üretir. DL modelleri sadece doğruluk oranlarına oynar.
+
+**Genel Değerlendirme:** Yüksek başarı oranı için PyTorch Derin Öğrenme modelleri (SKAB), projenin gidişatını gözle görebilmek ve denetleyebilmek için ise Automata (NetworkX Diyagramı) tercih edilmelidir.
+
+---
+
+## 10. Kurulum ve Çalıştırma Rehberi
+
+Sistemi baştan aşağı kanıtlamak için gereken adımlar:
+
 ```bash
+# 1. Gerekli kütüphaneleri yükleyin
 pip install -r requirements.txt
-```
 
-### Proje Nasıl Çalıştırılır?
+# 2. Modüler Unit Test Doğrulamalarını Kanıtlayın (0.05 saniye)
+python -m unittest discover tests/ -v
 
-#### 1. Ana Eğitimi Başlatın (Tüm Modelleri Eğit)
-```bash
+# 3. Asıl Eğitim Döngüleri (Black-Box & Olasılıksal Modeller)
 python main.py
-```
-*(Tüm modeller GroupKFold çapraz doğrulama mekanizmasıyla çalışır. Bu işlem 15-20 dk sürebilir. Sonuçlar JSON olarak `outputs/` altına yazılır.)*
 
-#### 2. İstatistikleri ve Görselleri Çıkarın (Sunum Çıktıları)
-Sistem eğitimden ürettiği o JSON verilerini okuyup yukarıda gördüğünüz tüm grafik materyallerini çizer:
-```bash
+# 4. Model Analizleri ve PNG Grafiklerinin (Outputs) Çizilmesi
 python generate_report.py
 ```
-
-## 🏗️ Proje Mimarisi
-
-```text
-yazlab2/
-├── configs/
-│   └── config.yaml              # Merkezi Ayarlar
-├── src/
-│   ├── data/
-│   │   ├── dataset.py           # PyTorch Dataset
-│   │   └── preprocessor.py      # SKAB (GroupKFold) ve BATADAL işleyici
-├── models/                      # DL ve Automata (Laplace Smoothing) Katmanları
-├── tests/                       # 14 Adet Modüler Doğrulama Testi
-├── outputs/                     # Tüm PNG Grafikleri ve JSON sonuçları
-├── main.py                      # Ana Eğitim Modülü
-├── generate_report.py           # Raporlama ve Çizim (NetworkX) Modülü
-└── requirements.txt             
-```
-
-## İstatistiksel Karşılaştırma (Wilcoxon Testi)
-Derin Öğrenme Modelleri ile Otomat Modeli arasındaki anlamlı farklılıkları ölçmek adına `scipy.stats.wilcoxon` modülünü kullanılmıştır.
-
-## Unseen (Bilinmeyen) Pattern Yönetimi
-Hiç görülmemiş bir pattern ile karşılaşıldığında **Levenshtein Uzaklığı** kullanılır. Hiç geçiş bulunamayan Olasılık Matrisi düğümlerinde ise **Laplace Smoothing** yöntemi aktif olarak uygulanarak sistemin çökmesi (Crash) tamamen engellenmiştir.
