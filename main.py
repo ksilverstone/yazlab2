@@ -1,67 +1,100 @@
 import os
 import yaml
 from src.pipeline import TimeSeriesPipeline
-from src.utils.metrics import save_explainability_log
+from src.utils.metrics import save_experiment_results
+
 
 def main():
     config_path = "configs/config.yaml"
-    
-    # config.yaml yoksa kodun patlamaması için varsayılan dict oluştur ve kaydet
-    if not os.path.exists(config_path):
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        default_config = {
-            "experiment": {"log_dir": "logs", "random_seeds": [42, 123, 2026, 7, 999]},
-            "data": {
-                "skab": {"raw_dir": "data/raw/SKAB", "group_col": "source_file"},
-                "batadal": {
-                    "file_path": "data/raw/BATADAL/Training_Dataset_2.csv",
-                    "train_ratio": 0.6,
-                    "val_ratio": 0.2,
-                    "test_ratio": 0.2
-                }
-            },
-            "preprocessing": {"scaler": "StandardScaler", "pca_n_components": 1},
-            "deep_learning": {
-                "max_epochs": 50,
-                "batch_size": 32,
-                "learning_rate": 0.001,
-                "early_stopping_patience": 5,
-                "models": {
-                    "lstm": {"hidden_size": 64, "num_layers": 2, "dropout": 0.2}
-                }
-            },
-            "automata": {
-                "paa_size": 4,
-                "sax_alphabet_size": 3,
-                "window_size": 4,
-                "anomaly_threshold": 0.05
-            }
-        }
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(default_config, f, allow_unicode=True)
 
-    try:
-        # Pipeline Kurulumu (Init)
-        pipeline = TimeSeriesPipeline(config_path)
-        
-        # 1. Eğitim (Train): Veri hazırlama, DL eğitimi, SAX/TPM öğrenimi
-        pipeline.train_pipeline()
-        
-        # 2. Test ve Karar (Evaluate): Olasılıksal logların JSON formatında üretimi
-        results = pipeline.evaluate_pipeline()
-        
-        # 3. Klasör Kontrolü ve Dosyaya Yazma
-        output_dir = "outputs"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        output_path = os.path.join(output_dir, "explainability_log.json")
-        save_explainability_log(results, output_path)
-        
-        print("İşlem başarıyla tamamlandı, loglar outputs klasörüne kaydedildi.")
-        
-    except Exception as e:
-        # Hata anında konsolu çok kirletmemek adına kısa bir özet (PDF kurallarına istinaden)
-        print(f"Bilinmeyen bir hata oluştu: {str(e)}")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config dosyası bulunamadı: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    output_dir = config.get("experiment", {}).get("output_dir", "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+
+    pipeline = TimeSeriesPipeline(config_path)
+
+    all_experiment_results = {}
+
+    # ==================== 1. BATADAL Deneyleri ====================
+    print("=" * 60)
+    print("BATADAL - Temel Deneyler Başlıyor...")
+    print("=" * 60)
+
+    batadal_results = pipeline.run_batadal_pipeline()
+    all_experiment_results["batadal_base"] = batadal_results
+
+    if batadal_results:
+        print("\nBATADAL Sonuçları:")
+        for model_name, metrics in batadal_results.items():
+            f1_info = metrics.get("f1_score", {})
+            print(
+                f"  {model_name}: F1 = {f1_info.get('mean', 0):.4f} ± {f1_info.get('std', 0):.4f}"
+            )
+
+    # ==================== 2. SKAB Deneyleri ====================
+    print("\n" + "=" * 60)
+    print("SKAB - GroupKFold Deneyleri Başlıyor...")
+    print("=" * 60)
+
+    skab_results = pipeline.run_skab_pipeline()
+    all_experiment_results["skab_base"] = skab_results
+
+    if skab_results:
+        print("\nSKAB Sonuçları:")
+        for model_name, metrics in skab_results.items():
+            f1_info = metrics.get("f1_score", {})
+            print(
+                f"  {model_name}: F1 = {f1_info.get('mean', 0):.4f} ± {f1_info.get('std', 0):.4f}"
+            )
+
+    # ==================== 3. Gürültü Deneyleri ====================
+    print("\n" + "=" * 60)
+    print("BATADAL - Gürültü Deneyleri Başlıyor...")
+    print("=" * 60)
+
+    noise_results = pipeline.run_noise_experiment("batadal")
+    all_experiment_results["batadal_noise"] = noise_results
+
+    if noise_results:
+        print("\nGürültülü BATADAL Sonuçları:")
+        for model_name, metrics in noise_results.items():
+            print(f"  {model_name}: F1 = {metrics.get('f1_score', 0):.4f}")
+
+    # ==================== 4. Parametre Varyasyonu ====================
+    print("\n" + "=" * 60)
+    print("BATADAL - Parametre Varyasyonu Başlıyor...")
+    print("=" * 60)
+
+    param_results = pipeline.run_parameter_variation("batadal")
+    all_experiment_results["batadal_param_variation"] = param_results
+
+    if param_results:
+        print("\nWindow Size Varyasyonu:")
+        for ws, metrics in param_results.get("window_size", {}).items():
+            print(
+                f"  w={ws}: F1={metrics.get('f1_score', 0):.4f}, States={metrics.get('state_count', 0)}"
+            )
+
+        print("\nAlphabet Size Varyasyonu:")
+        for als, metrics in param_results.get("alphabet_size", {}).items():
+            print(
+                f"  a={als}: F1={metrics.get('f1_score', 0):.4f}, States={metrics.get('state_count', 0)}"
+            )
+
+    # ==================== 5. Sonuçları Kaydet ====================
+    save_experiment_results(
+        all_experiment_results, os.path.join(output_dir, "all_experiment_results.json")
+    )
+
+    print("\n" + "=" * 60)
+    print(f"Tüm deneyler tamamlandı. Sonuçlar '{output_dir}/' altına kaydedildi.")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
