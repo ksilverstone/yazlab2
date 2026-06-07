@@ -72,7 +72,10 @@ def generate_confusion_matrices(config_path: str, output_dir: str):
         trainer = ModelTrainer(model, train_loader, val_loader, criterion, optimizer, config)
         trained_model = trainer.train()
 
-        y_pred, y_true = TimeSeriesPipeline._predict_dl(trained_model, test_loader)
+        val_probs, val_true = TimeSeriesPipeline._predict_dl_probs(trained_model, val_loader)
+        best_dl_thresh = TimeSeriesPipeline._tune_dl_threshold(val_probs, val_true)
+
+        y_pred, y_true = TimeSeriesPipeline._predict_dl(trained_model, test_loader, threshold=best_dl_thresh)
         cm = compute_confusion_matrix(y_true, y_pred)
         plot_confusion_matrix(
             cm,
@@ -85,12 +88,12 @@ def generate_confusion_matrices(config_path: str, output_dir: str):
     set_seed(42)
     transformer = DataTransformer(config_path)
     _, X_train_auto = transformer.fit_transform(X_train)
+    _, X_val_auto = transformer.transform(X_val)
     _, X_test_auto = transformer.transform(X_test)
 
     paa_size = config.get("automata", {}).get("paa_size", 4)
     alphabet_size = config.get("automata", {}).get("sax_alphabet_size", 3)
     window_size = config.get("automata", {}).get("window_size", 4)
-    anomaly_threshold = config.get("automata", {}).get("anomaly_threshold", 0.05)
 
     symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
     automata = AutomataModel(window_size=window_size)
@@ -98,8 +101,11 @@ def generate_confusion_matrices(config_path: str, output_dir: str):
     sax_train = symbolizer.transform(X_train_auto.flatten())
     automata.fit(sax_train)
 
+    sax_val = symbolizer.transform(X_val_auto.flatten())
+    automata.tune_threshold(sax_val, y_val, paa_size)
+
     sax_test = symbolizer.transform(X_test_auto.flatten())
-    preds = automata.predict_labels(sax_test, anomaly_threshold)
+    preds = automata.predict_labels(sax_test, None)
 
     y_test_arr = np.array(y_test)
     min_len = min(len(preds), len(y_test_arr))

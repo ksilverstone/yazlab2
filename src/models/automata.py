@@ -51,6 +51,7 @@ class AutomataModel:
         self.window_size = window_size
         self.transition_matrix = {}
         self.known_states = set()
+        self.anomaly_threshold = 0.05
 
     def _extract_patterns(self, sax_string: str) -> list:
         """Uzun SAX karakter dizisini window_size uzunluğunda kayan pencerelere böler."""
@@ -78,6 +79,8 @@ class AutomataModel:
             if next_state not in counts[curr_state]:
                 counts[curr_state][next_state] = 0
             counts[curr_state][next_state] += 1
+
+        self.num_observed_transitions = sum(len(t) for t in counts.values())
 
         n_states = len(self.known_states)
         for curr_state, transitions in counts.items():
@@ -121,85 +124,162 @@ class AutomataModel:
 
         return nearest_pattern, min_distance
 
-    def predict_and_explain(self, test_sax_string: str, anomaly_threshold: float = 0.05) -> list:
+    def get_step_probabilities(self, sax_string: str) -> np.ndarray:
+        """Her zaman adımı için geçiş ve yol olasılıklarını hesaplar."""
+        patterns = self._extract_patterns(sax_string)
+        if not patterns:
+            return np.array([])
+            
+        epsilon = 1e-5
+        states = []
+        for p in patterns:
+            if p in self.known_states:
+                states.append(p)
+            else:
+                mapped, _ = self._map_unseen_pattern(p)
+                states.append(mapped)
+
+        probs = []
+        for i in range(len(patterns)):
+            p1 = 1.0
+            if i > 0:
+                prev_state = states[i - 1]
+                current_state = states[i]
+                if prev_state in self.transition_matrix:
+                    p1 = self.transition_matrix[prev_state].get(current_state, epsilon)
+                else:
+                    p1 = epsilon
+
+            p2 = 1.0
+            if i < len(patterns) - 1:
+                current_state = states[i]
+                next_state = states[i + 1]
+                if current_state in self.transition_matrix:
+                    p2 = self.transition_matrix[current_state].get(next_state, epsilon)
+                else:
+                    p2 = epsilon
+
+            step_path_prob = p1 * p2
+            probs.append(step_path_prob)
+            
+        return np.array(probs)
+
+    def tune_threshold(self, val_sax_string: str, y_val: np.ndarray, paa_size: int) -> float:
+        """Validation verisi üzerinde F1 skorunu maksimize edecek eşik değerini bulur."""
+        probs = self.get_step_probabilities(val_sax_string)
+        if len(probs) == 0:
+            return 0.05
+
+        best_threshold = 0.05
+        best_f1 = -1.0
+        
+        # Arama uzayı: olasılıkların farklı yüzdelik dilimleri
+        candidates = np.percentile(probs, np.linspace(0.1, 99.9, 100))
+        
+        y_val_arr = np.array(y_val)
+        from sklearn.metrics import f1_score
+        
+        for threshold in candidates:
+            preds = [1 if p < threshold else 0 for p in probs]
+            
+            aligned_preds = np.zeros(len(y_val_arr), dtype=int)
+            for i, p in enumerate(preds):
+                start_idx = (i + self.window_size - 1) * paa_size
+                end_idx = min(start_idx + paa_size, len(y_val_arr))
+                if p == 1:
+                    aligned_preds[start_idx:end_idx] = 1
+                    
+            f1 = f1_score(y_val_arr, aligned_preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+                
+        self.anomaly_threshold = best_threshold
+        return best_threshold
+
+    def predict_and_explain(self, test_sax_string: str, anomaly_threshold: float = None) -> list:
         """
         Test verisi üzerinde adım adım geçiş olasılıklarını hesaplar
         ve açıklanabilir (explainable) JSON sonuçları üretir.
-
-        Çıktı formatı PDF gereksinimlerini karşılar:
-        - state, pattern, status, mapped_to
-        - transitions listesi
-        - probability (geçiş olasılığı)
-        - path_probability (kümülatif)
-        - confidence_score
-        - decision
         """
+        if anomaly_threshold is None:
+            anomaly_threshold = self.anomaly_threshold
+
         patterns = self._extract_patterns(test_sax_string)
         results = []
 
         epsilon = 1e-5
-        cumulative_log_prob = 0.0
 
+        # 1. Tüm pattern'lar için durumları ve durum tiplerini belirle
+        states = []
+        statuses = []
+        mapped_tos = []
+        mapping_distances = []
+        for p in patterns:
+            if p in self.known_states:
+                states.append(p)
+                statuses.append("seen")
+                mapped_tos.append(None)
+                mapping_distances.append(0)
+            else:
+                mapped, dist = self._map_unseen_pattern(p)
+                states.append(mapped)
+                statuses.append("unseen")
+                mapped_tos.append(mapped)
+                mapping_distances.append(dist)
+
+        # 2. Her zaman adımı için geçiş ve yol olasılıklarını hesapla
         for i in range(len(patterns)):
+            current_state = states[i]
             raw_pattern = patterns[i]
+            status = statuses[i]
+            mapped_to = mapped_tos[i]
+            mapping_distance = mapping_distances[i]
 
-            # 1. Durum Kontrolü ve Haritalama
-            if raw_pattern in self.known_states:
-                status = "seen"
-                mapped_to = None
-                mapping_distance = 0
-                current_state = raw_pattern
-            else:
-                status = "unseen"
-                mapped_to, mapping_distance = self._map_unseen_pattern(raw_pattern)
-                current_state = mapped_to
-
-            # 2. Geçiş Olasılığı Hesabı
-            transition_prob = epsilon
-            transitions_detail = []
-
-            if i < len(patterns) - 1:
-                next_raw = patterns[i + 1]
-
-                if next_raw in self.known_states:
-                    next_state = next_raw
+            p1 = 1.0
+            p1_detail = None
+            if i > 0:
+                prev_state = states[i - 1]
+                if prev_state in self.transition_matrix:
+                    p1 = self.transition_matrix[prev_state].get(current_state, epsilon)
                 else:
-                    next_state = self._map_unseen_pattern(next_raw)[0]
+                    p1 = epsilon
+                p1_detail = {"from": prev_state, "to": current_state, "probability": round(float(p1), 6)}
 
-                # Mevcut state'in tüm geçişlerini listele (yalnızca ihtimali yüksek olanlar)
+            p2 = 1.0
+            p2_detail = None
+            if i < len(patterns) - 1:
+                next_state = states[i + 1]
                 if current_state in self.transition_matrix:
-                    for target, prob in self.transition_matrix[current_state].items():
-                        if (
-                            prob > 1e-4
-                        ):  # Çok düşük (sadece laplace'dan gelen) olasılıkları filtrele
-                            transitions_detail.append(
-                                {"from": current_state, "to": target, "probability": round(prob, 6)}
-                            )
-                    transition_prob = self.transition_matrix[current_state].get(next_state, epsilon)
-            else:
-                transition_prob = 1.0
+                    p2 = self.transition_matrix[current_state].get(next_state, epsilon)
+                else:
+                    p2 = epsilon
+                p2_detail = {"from": current_state, "to": next_state, "probability": round(float(p2), 6)}
 
-            # 3. Path Probability (kümülatif, log-space underflow korumalı)
-            cumulative_log_prob += np.log(max(transition_prob, epsilon))
-            path_probability = float(np.exp(cumulative_log_prob))
+            # Path probability is the product of entering and leaving transitions (covers 3 states)
+            step_path_prob = p1 * p2
 
-            # 4. Güven Skoru (Confidence Score)
-            # Yüksek geçiş olasılığı = yüksek güven
-            confidence_score = round(float(transition_prob), 6)
+            transitions_detail = []
+            if p1_detail is not None:
+                transitions_detail.append(p1_detail)
+            if p2_detail is not None:
+                transitions_detail.append(p2_detail)
 
-            # 5. Anomali Kararı
-            decision = "anomaly" if transition_prob < anomaly_threshold else "normal"
+            # Confidence score is based on the transition step probability
+            confidence_score = round(float(step_path_prob), 6)
+
+            # Anomali kararı path olasılığına göre verilir
+            decision = "anomaly" if step_path_prob < anomaly_threshold else "normal"
 
             step_result = {
                 "time_step": i,
-                "state": current_state,
+                "state": states[i - 1] if i > 0 else None,
                 "pattern": raw_pattern,
                 "status": status,
                 "mapped_to": mapped_to,
                 "mapping_distance": mapping_distance,
                 "transitions": transitions_detail,
-                "probability": round(float(transition_prob), 6),
-                "path_probability": round(path_probability, 10),
+                "probability": round(float(step_path_prob), 6),
                 "confidence_score": confidence_score,
                 "decision": decision,
             }
@@ -207,8 +287,10 @@ class AutomataModel:
 
         return results
 
-    def predict_labels(self, test_sax_string: str, anomaly_threshold: float = 0.05) -> list:
+    def predict_labels(self, test_sax_string: str, anomaly_threshold: float = None) -> list:
         """Test verisi için binary anomali etiketleri üretir (0: normal, 1: anomaly)."""
+        if anomaly_threshold is None:
+            anomaly_threshold = self.anomaly_threshold
         explanations = self.predict_and_explain(test_sax_string, anomaly_threshold)
         return [1 if e["decision"] == "anomaly" else 0 for e in explanations]
 
@@ -222,5 +304,5 @@ class AutomataModel:
             return 0.0
         n_states = len(self.known_states)
         max_transitions = n_states * n_states
-        actual_transitions = sum(len(v) for v in self.transition_matrix.values())
+        actual_transitions = getattr(self, "num_observed_transitions", 0)
         return actual_transitions / max_transitions if max_transitions > 0 else 0.0

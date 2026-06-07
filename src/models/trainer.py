@@ -29,7 +29,7 @@ class ModelTrainer:
 
     def train(self):
         """Eğitim döngüsünü çalıştırır, early stopping uygular ve en iyi modeli döner."""
-        best_val_loss = float("inf")
+        best_val_loss = float('inf')
         patience_counter = 0
         best_model_state = None
 
@@ -50,6 +50,8 @@ class ModelTrainer:
             # --- Doğrulama (Validation) Aşaması ---
             self.model.eval()
             val_loss = 0.0
+            val_preds = []
+            val_targets = []
 
             with torch.no_grad():
                 for X_batch, y_batch in self.val_loader:
@@ -57,14 +59,15 @@ class ModelTrainer:
 
                     outputs = self.model(X_batch)
                     loss = self.criterion(outputs, y_batch)
-
-                    # Tüm batch'in loss toplamını bul
                     val_loss += loss.item() * X_batch.size(0)
 
-            # Ortalama Validation Loss hesabı
+                    preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                    val_preds.extend(preds)
+                    val_targets.extend(y_batch.cpu().numpy())
+
             val_loss /= len(self.val_loader.dataset)
 
-            # --- Early Stopping ve En İyi Modeli Kaydetme ---
+            # --- Early Stopping ve En İyi Modeli Kaydetme (Loss Minimizasyonu) ---
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0

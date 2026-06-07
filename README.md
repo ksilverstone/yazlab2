@@ -84,45 +84,45 @@ Aşağıdaki tablolar, modellerin kendi sistemimizde test edilmesiyle elde edile
 
 | Model | SKAB | BATADAL |
 |---|---|---|
-| **LSTM** | 0.8327 ± 0.005 | 0.0000 ± 0.000 |
-| **GRU** | 0.8389 ± 0.008 | 0.1252 ± 0.250 |
-| **1D-CNN** | 0.8256 ± 0.010 | 0.0000 ± 0.000 |
-| **Automata** | 0.0431 ± 0.000 | 0.0909 ± 0.000 |
+| **LSTM** | 0.8171 ± 0.009 | 0.0040 ± 0.008 |
+| **GRU** | 0.8222 ± 0.011 | 0.1781 ± 0.274 |
+| **1D-CNN** | 0.8191 ± 0.011 | 0.1981 ± 0.284 |
+| **Automata** | 0.4324 ± 0.000 | 0.1835 ± 0.000 |
 
 ### 5.2 Gürültü ve Unseen Veri Analizi (Robustness)
 **Tablo 2:** Gürültü Etkisi ve Unseen Senaryo Analizi
 
 | Model | Gürültü Etkisi (F1)<br>Orijinal | Gürültü Etkisi (F1)<br>Gürültülü | Unseen Analizi<br>Det. Rate | Unseen Analizi<br>Map. Acc. |
 |---|---|---|---|---|
-| **LSTM** | 0.8327 | 0.8210 | - | - |
-| **GRU** | 0.8389 | 0.8291 | - | - |
-| **1D-CNN**| 0.8256 | 0.8105 | - | - |
-| **Automata**| 0.0431 | 0.0450 | 1.000 | 1.000 |
+| **LSTM** | 0.0040 | 0.0000 | - | - |
+| **GRU** | 0.1781 | 0.0492 | - | - |
+| **1D-CNN**| 0.1981 | 0.7551 | - | - |
+| **Automata**| 0.1835 | 0.1802 | 1.000 | 1.000 |
 
 ### 5.3 Çapraz Veri Seti (Cross-Dataset) Genellenebilirliği
 **Tablo 3:** Cross-Dataset Performans Karşılaştırması
 
 | Train / Test | SKAB | BATADAL |
 |---|---|---|
-| **Train: SKAB** | 0.8389 | 0.083 |
-| **Train: BATADAL**| 0.519 | 0.1252 |
+| **Train: SKAB** | 0.8222 | 0.083 |
+| **Train: BATADAL**| 0.519 | 0.1781 |
 
 ### 5.4 Automata Parametre ve Süre Analizi
 **Tablo 4:** Automata Parametre Duyarlılık Analizi (F1-score)
 
 | Parametre | Değer = 3 | Değer = 4 | Değer = 5 | Değer = 6 |
 |---|---|---|---|---|
-| **Window Size** | 0.0000 | 0.0909 | 0.1250 | 0.1081 |
-| **Alphabet Size** | 0.0431 | 0.0850 | 0.1102 | 0.1150 |
+| **Window Size** | 0.2317 | 0.1835 | 0.1863 | 0.1176 |
+| **Alphabet Size** | 0.1835 | 0.1481 | 0.0217 | 0.1736 |
 
 **Tablo 5:** Modellerin Çalışma Süresi (Runtime) Karşılaştırması
 
 | Model | Training Time (sn) | Inference Time (sn) |
 |---|---|---|
-| **LSTM** | 850.5 | 0.045 |
-| **GRU** | 620.0 | 0.030 |
-| **1D-CNN** | 415.2 | 0.038 |
-| **Automata**| 0.005 | 0.001 |
+| **LSTM** | 48.5 | 0.045 |
+| **GRU** | 39.0 | 0.030 |
+| **1D-CNN** | 28.2 | 0.038 |
+| **Automata**| 0.025 | 0.001 |
 
 ---
 

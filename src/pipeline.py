@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.optim as optim
 
 from src.data.preprocessor import SKABPreprocessor, BATADALPreprocessor, DataTransformer
-from src.data.dataset import create_dataloaders
+from src.data.dataset import create_dataloaders, TimeSeriesDataset
+from torch.utils.data import DataLoader
 from src.models.dl_models import build_dl_model
 from src.models.trainer import ModelTrainer
 from src.models.automata import TimeSeriesSymbolizer, AutomataModel
@@ -61,16 +62,20 @@ class TimeSeriesPipeline:
                 window_size = self.config.get("automata", {}).get("window_size", 4)
                 batch_size = self.config.get("deep_learning", {}).get("batch_size", 32)
 
-                train_loader, val_loader, test_loader = create_dataloaders(
-                    X_train_dl,
-                    y_train,
-                    X_val_dl,
-                    y_val,
-                    X_test_dl,
-                    y_test,
-                    window_size=window_size,
-                    batch_size=batch_size,
-                )
+                train_dataset = TimeSeriesDataset(X_train_dl, y_train, window_size)
+                val_dataset = TimeSeriesDataset(X_val_dl, y_val, window_size)
+                test_dataset = TimeSeriesDataset(X_test_dl, y_test, window_size)
+
+                y_train_arr = np.array(y_train)
+                labels_for_windows = y_train_arr[window_size - 1:]
+                class_counts = np.bincount(labels_for_windows)
+                class_weights = 1.0 / (class_counts + 1e-8)
+                sample_weights = [class_weights[label] for label in labels_for_windows]
+                sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+                train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+                val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+                test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
                 input_size = X_train_dl.shape[1]
                 model = build_dl_model(model_name, input_size, self.config)
@@ -86,8 +91,12 @@ class TimeSeriesPipeline:
                 )
                 trained_model = trainer.train()
 
+                # Validation üzerinde eşik optimizasyonu
+                val_probs, val_true = self._predict_dl_probs(trained_model, val_loader)
+                best_dl_thresh = self._tune_dl_threshold(val_probs, val_true)
+
                 # Test üzerinde tahmin
-                y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader)
+                y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader, threshold=best_dl_thresh)
                 metrics = compute_metrics(y_true_aligned, y_pred)
                 seed_metrics.append(metrics)
 
@@ -102,12 +111,12 @@ class TimeSeriesPipeline:
             set_seed(seed)
             transformer = DataTransformer(self.config_path)
             _, X_train_auto = transformer.fit_transform(X_train)
+            _, X_val_auto = transformer.transform(X_val)
             _, X_test_auto = transformer.transform(X_test)
 
             paa_size = self.config.get("automata", {}).get("paa_size", 4)
             alphabet_size = self.config.get("automata", {}).get("sax_alphabet_size", 3)
             window_size = self.config.get("automata", {}).get("window_size", 4)
-            anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
 
             symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
             automata = AutomataModel(window_size=window_size)
@@ -117,22 +126,28 @@ class TimeSeriesPipeline:
             sax_train = symbolizer.transform(X_train_1d)
             automata.fit(sax_train)
 
+            # Validation set üzerinde threshold tuning
+            X_val_1d = X_val_auto.flatten()
+            sax_val = symbolizer.transform(X_val_1d)
+            automata.tune_threshold(sax_val, y_val, paa_size)
+
             X_test_1d = X_test_auto.flatten()
             sax_test = symbolizer.transform(X_test_1d)
 
-            predictions = automata.predict_labels(sax_test, anomaly_threshold)
-            explanations = automata.predict_and_explain(sax_test, anomaly_threshold)
+            predictions = automata.predict_labels(sax_test, None)
+            explanations = automata.predict_and_explain(sax_test, None)
 
-            # Automata çıktısı DL window'lu çıktıdan farklı uzunlukta olabileceğinden
-            # y_test'i uygun şekilde kırpıyoruz
-            n_preds = len(predictions)
+            # Automata çıktısı PAA ve Sliding Window nedeniyle farklı uzunluktadır.
+            # Tahminleri (predictions) orijinal zaman eksenine (y_test) hizalıyoruz:
             y_test_arr = np.array(y_test)
-            if n_preds < len(y_test_arr):
-                y_aligned = y_test_arr[:n_preds]
-            else:
-                y_aligned = y_test_arr
+            aligned_preds = np.zeros(len(y_test_arr), dtype=int)
+            for i, p in enumerate(predictions):
+                start_idx = (i + window_size - 1) * paa_size
+                end_idx = min(start_idx + paa_size, len(y_test_arr))
+                if p == 1:
+                    aligned_preds[start_idx:end_idx] = 1
 
-            metrics = compute_metrics(y_aligned, predictions[: len(y_aligned)])
+            metrics = compute_metrics(y_test_arr, aligned_preds)
             automata_seed_metrics.append(metrics)
             automata_explanations = explanations
 
@@ -191,16 +206,20 @@ class TimeSeriesPipeline:
                     window_size = self.config.get("automata", {}).get("window_size", 4)
                     batch_size = self.config.get("deep_learning", {}).get("batch_size", 32)
 
-                    train_loader, val_loader, test_loader = create_dataloaders(
-                        X_tr_dl,
-                        y_tr,
-                        X_vl_dl,
-                        y_vl,
-                        X_te_dl,
-                        y_test_fold,
-                        window_size=window_size,
-                        batch_size=batch_size,
-                    )
+                    train_dataset = TimeSeriesDataset(X_tr_dl, y_tr, window_size)
+                    val_dataset = TimeSeriesDataset(X_vl_dl, y_vl, window_size)
+                    test_dataset = TimeSeriesDataset(X_te_dl, y_test_fold, window_size)
+
+                    y_tr_arr = np.array(y_tr)
+                    labels_for_windows = y_tr_arr[window_size - 1:]
+                    class_counts = np.bincount(labels_for_windows)
+                    class_weights = 1.0 / (class_counts + 1e-8)
+                    sample_weights = [class_weights[label] for label in labels_for_windows]
+                    sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+                    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+                    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+                    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
                     input_size = X_tr_dl.shape[1]
                     model = build_dl_model(model_name, input_size, self.config)
@@ -215,7 +234,11 @@ class TimeSeriesPipeline:
                     )
                     trained_model = trainer.train()
 
-                    y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader)
+                    # Validation üzerinde eşik optimizasyonu
+                    val_probs, val_true = self._predict_dl_probs(trained_model, val_loader)
+                    best_dl_thresh = self._tune_dl_threshold(val_probs, val_true)
+
+                    y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader, threshold=best_dl_thresh)
                     metrics = compute_metrics(y_true_aligned, y_pred)
                     fold_metrics.append(metrics)
 
@@ -235,39 +258,53 @@ class TimeSeriesPipeline:
                 set_seed(seed)
 
                 X_train_fold = X.iloc[train_idx]
+                y_train_fold = y.iloc[train_idx]
                 X_test_fold = X.iloc[test_idx]
                 y_test_fold = y.iloc[test_idx]
 
+                # Train'i %80 train %20 val olarak böl (threshold tuning için)
+                n_train = len(X_train_fold)
+                val_split = int(n_train * 0.8)
+                X_tr = X_train_fold.iloc[:val_split]
+                X_vl = X_train_fold.iloc[val_split:]
+                y_vl = y_train_fold.iloc[val_split:]
+
                 transformer = DataTransformer(self.config_path)
-                _, X_train_auto = transformer.fit_transform(X_train_fold)
+                _, X_tr_auto = transformer.fit_transform(X_tr)
+                _, X_vl_auto = transformer.transform(X_vl)
                 _, X_test_auto = transformer.transform(X_test_fold)
 
                 paa_size = self.config.get("automata", {}).get("paa_size", 4)
                 alphabet_size = self.config.get("automata", {}).get("sax_alphabet_size", 3)
                 window_size = self.config.get("automata", {}).get("window_size", 4)
-                anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
 
                 symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
                 automata = AutomataModel(window_size=window_size)
 
-                X_train_1d = X_train_auto.flatten()
+                X_train_1d = X_tr_auto.flatten()
                 symbolizer.fit(X_train_1d)
                 sax_train = symbolizer.transform(X_train_1d)
                 automata.fit(sax_train)
 
+                # Validation set üzerinde threshold tuning
+                X_vl_1d = X_vl_auto.flatten()
+                sax_val = symbolizer.transform(X_vl_1d)
+                automata.tune_threshold(sax_val, y_vl, paa_size)
+
                 X_test_1d = X_test_auto.flatten()
                 sax_test = symbolizer.transform(X_test_1d)
 
-                predictions = automata.predict_labels(sax_test, anomaly_threshold)
+                predictions = automata.predict_labels(sax_test, None)
 
-                n_preds = len(predictions)
                 y_test_arr = np.array(y_test_fold)
-                if n_preds < len(y_test_arr):
-                    y_aligned = y_test_arr[:n_preds]
-                else:
-                    y_aligned = y_test_arr
+                aligned_preds = np.zeros(len(y_test_arr), dtype=int)
+                for i, p in enumerate(predictions):
+                    start_idx = (i + window_size - 1) * paa_size
+                    end_idx = min(start_idx + paa_size, len(y_test_arr))
+                    if p == 1:
+                        aligned_preds[start_idx:end_idx] = 1
 
-                metrics = compute_metrics(y_aligned, predictions[: len(y_aligned)])
+                metrics = compute_metrics(y_test_arr, aligned_preds)
                 fold_metrics.append(metrics)
 
             avg_fold = aggregate_seed_results(fold_metrics)
@@ -310,16 +347,20 @@ class TimeSeriesPipeline:
                 window_size = self.config.get("automata", {}).get("window_size", 4)
                 batch_size = self.config.get("deep_learning", {}).get("batch_size", 32)
 
-                train_loader, val_loader, test_loader = create_dataloaders(
-                    X_train_dl,
-                    y_train,
-                    X_val_dl,
-                    y_val,
-                    X_test_dl,
-                    y_test,
-                    window_size=window_size,
-                    batch_size=batch_size,
-                )
+                train_dataset = TimeSeriesDataset(X_train_dl, y_train, window_size)
+                val_dataset = TimeSeriesDataset(X_val_dl, y_val, window_size)
+                test_dataset = TimeSeriesDataset(X_test_dl, y_test, window_size)
+
+                y_train_arr = np.array(y_train)
+                labels_for_windows = y_train_arr[window_size - 1:]
+                class_counts = np.bincount(labels_for_windows)
+                class_weights = 1.0 / (class_counts + 1e-8)
+                sample_weights = [class_weights[label] for label in labels_for_windows]
+                sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+                train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+                val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+                test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
                 input_size = X_train_dl.shape[1]
                 model = build_dl_model(model_name, input_size, self.config)
@@ -333,19 +374,23 @@ class TimeSeriesPipeline:
                 )
                 trained_model = trainer.train()
 
-                y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader)
+                # Validation üzerinde eşik optimizasyonu
+                val_probs, val_true = self._predict_dl_probs(trained_model, val_loader)
+                best_dl_thresh = self._tune_dl_threshold(val_probs, val_true)
+
+                y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader, threshold=best_dl_thresh)
                 results[model_name] = compute_metrics(y_true_aligned, y_pred)
 
             # Automata noise
             set_seed(42)
             transformer = DataTransformer(self.config_path)
             _, X_train_auto = transformer.fit_transform(X_train)
+            _, X_val_auto = transformer.transform(X_val)
             _, X_test_auto = transformer.transform(X_test_noisy)
 
             paa_size = self.config.get("automata", {}).get("paa_size", 4)
             alphabet_size = self.config.get("automata", {}).get("sax_alphabet_size", 3)
             window_size = self.config.get("automata", {}).get("window_size", 4)
-            anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
 
             symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
             automata_model = AutomataModel(window_size=window_size)
@@ -353,12 +398,22 @@ class TimeSeriesPipeline:
             sax_train = symbolizer.transform(X_train_auto.flatten())
             automata_model.fit(sax_train)
 
+            # Validation set üzerinde threshold tuning
+            X_val_1d = X_val_auto.flatten()
+            sax_val = symbolizer.transform(X_val_1d)
+            automata_model.tune_threshold(sax_val, y_val, paa_size)
+
             sax_test = symbolizer.transform(X_test_auto.flatten())
-            preds = automata_model.predict_labels(sax_test, anomaly_threshold)
+            preds = automata_model.predict_labels(sax_test, None)
             y_test_arr = np.array(y_test)
-            preds = preds[: len(y_test_arr)]
-            y_aligned = y_test_arr[: len(preds)]
-            results["automata"] = compute_metrics(y_aligned, preds)
+            aligned_preds = np.zeros(len(y_test_arr), dtype=int)
+            for i, p in enumerate(preds):
+                start_idx = (i + window_size - 1) * paa_size
+                end_idx = min(start_idx + paa_size, len(y_test_arr))
+                if p == 1:
+                    aligned_preds[start_idx:end_idx] = 1
+            
+            results["automata"] = compute_metrics(y_test_arr, aligned_preds)
 
             return results
 
@@ -381,10 +436,10 @@ class TimeSeriesPipeline:
             set_seed(42)
             transformer = DataTransformer(self.config_path)
             _, X_train_auto = transformer.fit_transform(X_train)
+            _, X_val_auto = transformer.transform(X_val)
             _, X_test_auto = transformer.transform(X_test)
 
             results = {"window_size": {}, "alphabet_size": {}}
-            anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
 
             # Window size varyasyonu (alphabet sabit = 3)
             for ws in window_sizes:
@@ -396,14 +451,23 @@ class TimeSeriesPipeline:
                 sax_train = symbolizer.transform(X_train_auto.flatten())
                 automata.fit(sax_train)
 
+                # Validation set üzerinde threshold tuning
+                X_val_1d = X_val_auto.flatten()
+                sax_val = symbolizer.transform(X_val_1d)
+                automata.tune_threshold(sax_val, y_val, paa_size)
+
                 sax_test = symbolizer.transform(X_test_auto.flatten())
-                preds = automata.predict_labels(sax_test, anomaly_threshold)
+                preds = automata.predict_labels(sax_test, None)
 
                 y_test_arr = np.array(y_test)
-                preds = preds[: len(y_test_arr)]
-                y_aligned = y_test_arr[: len(preds)]
+                aligned_preds = np.zeros(len(y_test_arr), dtype=int)
+                for i, p in enumerate(preds):
+                    start_idx = (i + ws - 1) * paa_size
+                    end_idx = min(start_idx + paa_size, len(y_test_arr))
+                    if p == 1:
+                        aligned_preds[start_idx:end_idx] = 1
 
-                metrics = compute_metrics(y_aligned, preds)
+                metrics = compute_metrics(y_test_arr, aligned_preds)
                 metrics["state_count"] = automata.get_state_count()
                 metrics["transition_density"] = automata.get_transition_density()
                 results["window_size"][ws] = metrics
@@ -417,14 +481,23 @@ class TimeSeriesPipeline:
                 sax_train = symbolizer.transform(X_train_auto.flatten())
                 automata.fit(sax_train)
 
+                # Validation set üzerinde threshold tuning
+                X_val_1d = X_val_auto.flatten()
+                sax_val = symbolizer.transform(X_val_1d)
+                automata.tune_threshold(sax_val, y_val, 4)
+
                 sax_test = symbolizer.transform(X_test_auto.flatten())
-                preds = automata.predict_labels(sax_test, anomaly_threshold)
+                preds = automata.predict_labels(sax_test, None)
 
                 y_test_arr = np.array(y_test)
-                preds = preds[: len(y_test_arr)]
-                y_aligned = y_test_arr[: len(preds)]
+                aligned_preds = np.zeros(len(y_test_arr), dtype=int)
+                for i, p in enumerate(preds):
+                    start_idx = (i + 4 - 1) * 4 # window_size=4, paa_size=4
+                    end_idx = min(start_idx + 4, len(y_test_arr))
+                    if p == 1:
+                        aligned_preds[start_idx:end_idx] = 1
 
-                metrics = compute_metrics(y_aligned, preds)
+                metrics = compute_metrics(y_test_arr, aligned_preds)
                 metrics["state_count"] = automata.get_state_count()
                 metrics["transition_density"] = automata.get_transition_density()
                 results["alphabet_size"][als] = metrics
@@ -436,19 +509,40 @@ class TimeSeriesPipeline:
     # ==================== Yardımcı Metotlar ====================
 
     @staticmethod
-    def _predict_dl(model, test_loader) -> tuple:
-        """DL modelinin test loader üzerindeki tahminlerini ve gerçek etiketlerini döner."""
+    def _predict_dl_probs(model, data_loader) -> tuple:
+        """DL modelinin veri yükleyici üzerindeki tahmin olasılıklarını (Softmax class 1) ve gerçek etiketlerini döner."""
         device = next(model.parameters()).device
         model.eval()
-        all_preds = []
+        all_probs = []
         all_labels = []
 
         with torch.no_grad():
-            for X_batch, y_batch in test_loader:
+            for X_batch, y_batch in data_loader:
                 X_batch = X_batch.to(device)
                 outputs = model(X_batch)
-                preds = torch.argmax(outputs, dim=1).cpu().numpy()
-                all_preds.extend(preds)
+                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                all_probs.extend(probs)
                 all_labels.extend(y_batch.numpy())
 
-        return np.array(all_preds), np.array(all_labels)
+        return np.array(all_probs), np.array(all_labels)
+
+    @staticmethod
+    def _tune_dl_threshold(probs, y_true) -> float:
+        from sklearn.metrics import f1_score
+        best_threshold = 0.5
+        best_f1 = -1.0
+        candidates = np.linspace(0.01, 0.99, 99)
+        for threshold in candidates:
+            preds = (probs >= threshold).astype(int)
+            f1 = f1_score(y_true, preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+        return best_threshold
+
+    @staticmethod
+    def _predict_dl(model, test_loader, threshold: float = 0.5) -> tuple:
+        """DL modelinin test loader üzerindeki tahminlerini ve gerçek etiketlerini döner."""
+        probs, labels = TimeSeriesPipeline._predict_dl_probs(model, test_loader)
+        preds = (probs >= threshold).astype(int)
+        return preds, labels
