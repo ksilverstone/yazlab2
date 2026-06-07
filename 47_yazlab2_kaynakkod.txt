@@ -1,0 +1,1875 @@
+============================================================
+YAZLAB 2 PROJESİ TÜM KAYNAK KODLAR
+Grup: 48
+============================================================
+
+
+
+################################################################################
+### DOSYA YOLU: generate_report.py
+################################################################################
+
+"""
+Deney sonuçları tamamlandıktan sonra çalıştırılacak rapor üretme scripti.
+Görselleştirmeler, istatistiksel testler ve özet tabloları üretir.
+"""
+
+import os
+import json
+import yaml
+import numpy as np
+
+from src.pipeline import TimeSeriesPipeline, set_seed
+from src.data.preprocessor import BATADALPreprocessor, SKABPreprocessor, DataTransformer
+from src.data.dataset import create_dataloaders
+from src.models.dl_models import build_dl_model
+from src.models.automata import TimeSeriesSymbolizer, AutomataModel
+from src.models.trainer import ModelTrainer
+from src.utils.metrics import compute_metrics, compute_confusion_matrix, save_experiment_results
+from src.utils.visualization import (
+    plot_confusion_matrix,
+    plot_transition_heatmap,
+    plot_parameter_sensitivity,
+    plot_model_comparison,
+    plot_precision_recall_curve,
+)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+def generate_confusion_matrices(config_path: str, output_dir: str):
+    """Her model için confusion matrix üretir ve kaydeder."""
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    preprocessor = BATADALPreprocessor(config_path)
+    X_train, y_train, X_val, y_val, X_test, y_test = preprocessor.load_and_split_data()
+    if X_train.empty:
+        return
+
+    cm_dir = os.path.join(output_dir, "confusion_matrices")
+    os.makedirs(cm_dir, exist_ok=True)
+
+    # DL modelleri
+    for model_name in ["lstm", "gru", "cnn_1d"]:
+        set_seed(42)
+        transformer = DataTransformer(config_path)
+        X_train_dl, _ = transformer.fit_transform(X_train)
+        X_val_dl, _ = transformer.transform(X_val)
+        X_test_dl, _ = transformer.transform(X_test)
+
+        window_size = config.get("automata", {}).get("window_size", 4)
+        batch_size = config.get("deep_learning", {}).get("batch_size", 32)
+
+        train_loader, val_loader, test_loader = create_dataloaders(
+            X_train_dl,
+            y_train,
+            X_val_dl,
+            y_val,
+            X_test_dl,
+            y_test,
+            window_size=window_size,
+            batch_size=batch_size,
+        )
+
+        input_size = X_train_dl.shape[1]
+        model = build_dl_model(model_name, input_size, config)
+        optimizer = optim.Adam(
+            model.parameters(), lr=config.get("deep_learning", {}).get("learning_rate", 0.001)
+        )
+        criterion = nn.CrossEntropyLoss()
+        trainer = ModelTrainer(model, train_loader, val_loader, criterion, optimizer, config)
+        trained_model = trainer.train()
+
+        y_pred, y_true = TimeSeriesPipeline._predict_dl(trained_model, test_loader)
+        cm = compute_confusion_matrix(y_true, y_pred)
+        plot_confusion_matrix(
+            cm,
+            title=f"Confusion Matrix - {model_name.upper()} (BATADAL)",
+            save_path=os.path.join(cm_dir, f"cm_{model_name}_batadal.png"),
+        )
+        print(f"  CM kaydedildi: {model_name}")
+
+    # Automata
+    set_seed(42)
+    transformer = DataTransformer(config_path)
+    _, X_train_auto = transformer.fit_transform(X_train)
+    _, X_test_auto = transformer.transform(X_test)
+
+    paa_size = config.get("automata", {}).get("paa_size", 4)
+    alphabet_size = config.get("automata", {}).get("sax_alphabet_size", 3)
+    window_size = config.get("automata", {}).get("window_size", 4)
+    anomaly_threshold = config.get("automata", {}).get("anomaly_threshold", 0.05)
+
+    symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
+    automata = AutomataModel(window_size=window_size)
+    symbolizer.fit(X_train_auto.flatten())
+    sax_train = symbolizer.transform(X_train_auto.flatten())
+    automata.fit(sax_train)
+
+    sax_test = symbolizer.transform(X_test_auto.flatten())
+    preds = automata.predict_labels(sax_test, anomaly_threshold)
+
+    y_test_arr = np.array(y_test)
+    min_len = min(len(preds), len(y_test_arr))
+    cm = compute_confusion_matrix(y_test_arr[:min_len], preds[:min_len])
+    plot_confusion_matrix(
+        cm,
+        title="Confusion Matrix - Automata (BATADAL)",
+        save_path=os.path.join(cm_dir, "cm_automata_batadal.png"),
+    )
+
+    # Transition heatmap ve State Diagram
+    plot_transition_heatmap(
+        automata.transition_matrix,
+        title="Transition Probability Heatmap",
+        save_path=os.path.join(output_dir, "transition_heatmap.png"),
+    )
+    print("  Transition heatmap kaydedildi")
+
+    from src.utils.visualization import plot_automata_state_diagram
+
+    plot_automata_state_diagram(
+        automata.transition_matrix,
+        title="Automata State Diagram",
+        save_path=os.path.join(output_dir, "automata_state_diagram.png"),
+    )
+    print("  State diagram kaydedildi")
+
+
+def generate_parameter_plots(config_path: str, output_dir: str):
+    """Parametre varyasyonu grafiklerini üretir."""
+    results_path = os.path.join(output_dir, "all_experiment_results.json")
+    if not os.path.exists(results_path):
+        print("  Deney sonuçları bulunamadı, parametre grafikleri atlanıyor.")
+        return
+
+    with open(results_path) as f:
+        all_results = json.load(f)
+
+    param_results = all_results.get("batadal_param_variation", {})
+    plots_dir = os.path.join(output_dir, "parameter_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Window size
+    ws_data = param_results.get("window_size", {})
+    if ws_data:
+        plot_parameter_sensitivity(
+            ws_data,
+            "Window Size",
+            "f1_score",
+            title="Window Size vs F1-Score",
+            save_path=os.path.join(plots_dir, "window_size_sensitivity.png"),
+        )
+
+    # Alphabet size
+    as_data = param_results.get("alphabet_size", {})
+    if as_data:
+        plot_parameter_sensitivity(
+            as_data,
+            "Alphabet Size",
+            "f1_score",
+            title="Alphabet Size vs F1-Score",
+            save_path=os.path.join(plots_dir, "alphabet_size_sensitivity.png"),
+        )
+
+    print("  Parametre grafikleri kaydedildi")
+
+
+def generate_model_comparison(config_path: str, output_dir: str):
+    """Model karşılaştırma grafiklerini üretir."""
+    results_path = os.path.join(output_dir, "all_experiment_results.json")
+    if not os.path.exists(results_path):
+        return
+
+    with open(results_path) as f:
+        all_results = json.load(f)
+
+    plots_dir = os.path.join(output_dir, "comparison_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    for dataset_key in ["batadal_base", "skab_base"]:
+        dataset_results = all_results.get(dataset_key, {})
+        if not dataset_results:
+            continue
+
+        comparison = {}
+        for model_name, metrics in dataset_results.items():
+            if isinstance(metrics, dict) and "f1_score" in metrics:
+                f1_data = metrics["f1_score"]
+                if isinstance(f1_data, dict):
+                    comparison[model_name] = f1_data.get("mean", 0)
+                else:
+                    comparison[model_name] = f1_data
+
+        if comparison:
+            dataset_label = dataset_key.replace("_base", "").upper()
+            plot_model_comparison(
+                {k: {"f1_score": v} for k, v in comparison.items()},
+                metric_name="f1_score",
+                title=f"Model Karşılaştırması - {dataset_label} (F1-Score)",
+                save_path=os.path.join(plots_dir, f"model_comparison_{dataset_key}.png"),
+            )
+
+    print("  Model karşılaştırma grafikleri kaydedildi")
+
+
+def run_statistical_tests(config_path: str, output_dir: str):
+    """Wilcoxon signed-rank test uygular."""
+    from scipy.stats import wilcoxon
+
+    results_path = os.path.join(output_dir, "all_experiment_results.json")
+    if not os.path.exists(results_path):
+        return {}
+
+    with open(results_path) as f:
+        all_results = json.load(f)
+
+    stat_results = {}
+
+    for dataset_key in ["batadal_base", "skab_base"]:
+        dataset_data = all_results.get(dataset_key, {})
+        if not dataset_data:
+            continue
+
+        stat_results[dataset_key] = {}
+        models = list(dataset_data.keys())
+        for i in range(len(models)):
+            for j in range(i + 1, len(models)):
+                m1, m2 = models[i], models[j]
+
+                # Raw listeleri al
+                raw_m1 = dataset_data[m1].get("raw_seed_f1", [])
+                raw_m2 = dataset_data[m2].get("raw_seed_f1", [])
+
+                f1_mean_m1 = (
+                    dataset_data[m1].get("f1_score", {}).get("mean", 0)
+                    if isinstance(dataset_data[m1].get("f1_score"), dict)
+                    else dataset_data[m1].get("f1_score", 0)
+                )
+                f1_mean_m2 = (
+                    dataset_data[m2].get("f1_score", {}).get("mean", 0)
+                    if isinstance(dataset_data[m2].get("f1_score"), dict)
+                    else dataset_data[m2].get("f1_score", 0)
+                )
+
+                res = {
+                    f"{m1}_f1_mean": f1_mean_m1,
+                    f"{m2}_f1_mean": f1_mean_m2,
+                    "difference": abs(f1_mean_m1 - f1_mean_m2),
+                }
+
+                # Wilcoxon için iki listenin en az 2 elemanlı olması gerekir
+                if len(raw_m1) > 1 and len(raw_m2) > 1 and len(raw_m1) == len(raw_m2):
+                    if raw_m1 == raw_m2:
+                        res["wilcoxon_p_value"] = 1.0
+                        res["statistically_significant"] = False
+                    else:
+                        try:
+                            w_stat, p_val = wilcoxon(raw_m1, raw_m2, zero_method="zsplit")
+                            res["wilcoxon_p_value"] = p_val
+                            res["statistically_significant"] = bool(p_val < 0.05)
+                        except Exception as e:
+                            res["wilcoxon_p_value"] = None
+                            res["statistically_significant"] = False
+                            res["error"] = str(e)
+                else:
+                    res["wilcoxon_p_value"] = None
+                    res["statistically_significant"] = False
+
+                stat_results[dataset_key][f"{m1}_vs_{m2}"] = res
+
+    save_path = os.path.join(output_dir, "statistical_tests.json")
+    with open(save_path, "w") as f:
+        json.dump(stat_results, f, indent=4)
+
+    print("  İstatistiksel test sonuçları kaydedildi")
+    return stat_results
+
+
+def main():
+    config_path = "configs/config.yaml"
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("=" * 60)
+    print("Rapor ve Görselleştirme Üretimi Başlıyor...")
+    print("=" * 60)
+
+    print("\n1. Confusion Matrix'ler üretiliyor...")
+    generate_confusion_matrices(config_path, output_dir)
+
+    print("\n2. Parametre grafikleri üretiliyor...")
+    generate_parameter_plots(config_path, output_dir)
+
+    print("\n3. Model karşılaştırma grafikleri üretiliyor...")
+    generate_model_comparison(config_path, output_dir)
+
+    print("\n4. İstatistiksel testler çalıştırılıyor...")
+    run_statistical_tests(config_path, output_dir)
+
+    print("\n" + "=" * 60)
+    print(f"Tüm raporlar '{output_dir}/' altına kaydedildi.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+
+################################################################################
+### DOSYA YOLU: main.py
+################################################################################
+
+import os
+import yaml
+from src.pipeline import TimeSeriesPipeline
+from src.utils.metrics import save_experiment_results
+
+
+def main():
+    config_path = "configs/config.yaml"
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config dosyası bulunamadı: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    output_dir = config.get("experiment", {}).get("output_dir", "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+
+    pipeline = TimeSeriesPipeline(config_path)
+
+    all_experiment_results = {}
+
+    # ==================== 1. BATADAL Deneyleri ====================
+    print("=" * 60)
+    print("BATADAL - Temel Deneyler Başlıyor...")
+    print("=" * 60)
+
+    batadal_results = pipeline.run_batadal_pipeline()
+    all_experiment_results["batadal_base"] = batadal_results
+
+    if batadal_results:
+        print("\nBATADAL Sonuçları:")
+        for model_name, metrics in batadal_results.items():
+            f1_info = metrics.get("f1_score", {})
+            print(
+                f"  {model_name}: F1 = {f1_info.get('mean', 0):.4f} ± {f1_info.get('std', 0):.4f}"
+            )
+
+    # ==================== 2. SKAB Deneyleri ====================
+    print("\n" + "=" * 60)
+    print("SKAB - GroupKFold Deneyleri Başlıyor...")
+    print("=" * 60)
+
+    skab_results = pipeline.run_skab_pipeline()
+    all_experiment_results["skab_base"] = skab_results
+
+    if skab_results:
+        print("\nSKAB Sonuçları:")
+        for model_name, metrics in skab_results.items():
+            f1_info = metrics.get("f1_score", {})
+            print(
+                f"  {model_name}: F1 = {f1_info.get('mean', 0):.4f} ± {f1_info.get('std', 0):.4f}"
+            )
+
+    # ==================== 3. Gürültü Deneyleri ====================
+    print("\n" + "=" * 60)
+    print("BATADAL - Gürültü Deneyleri Başlıyor...")
+    print("=" * 60)
+
+    noise_results = pipeline.run_noise_experiment("batadal")
+    all_experiment_results["batadal_noise"] = noise_results
+
+    if noise_results:
+        print("\nGürültülü BATADAL Sonuçları:")
+        for model_name, metrics in noise_results.items():
+            print(f"  {model_name}: F1 = {metrics.get('f1_score', 0):.4f}")
+
+    # ==================== 4. Parametre Varyasyonu ====================
+    print("\n" + "=" * 60)
+    print("BATADAL - Parametre Varyasyonu Başlıyor...")
+    print("=" * 60)
+
+    param_results = pipeline.run_parameter_variation("batadal")
+    all_experiment_results["batadal_param_variation"] = param_results
+
+    if param_results:
+        print("\nWindow Size Varyasyonu:")
+        for ws, metrics in param_results.get("window_size", {}).items():
+            print(
+                f"  w={ws}: F1={metrics.get('f1_score', 0):.4f}, States={metrics.get('state_count', 0)}"
+            )
+
+        print("\nAlphabet Size Varyasyonu:")
+        for als, metrics in param_results.get("alphabet_size", {}).items():
+            print(
+                f"  a={als}: F1={metrics.get('f1_score', 0):.4f}, States={metrics.get('state_count', 0)}"
+            )
+
+    # ==================== 5. Sonuçları Kaydet ====================
+    save_experiment_results(
+        all_experiment_results, os.path.join(output_dir, "all_experiment_results.json")
+    )
+
+    print("\n" + "=" * 60)
+    print(f"Tüm deneyler tamamlandı. Sonuçlar '{output_dir}/' altına kaydedildi.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+
+################################################################################
+### DOSYA YOLU: tests/__init__.py
+################################################################################
+
+# tests package
+
+
+################################################################################
+### DOSYA YOLU: tests/test_automata.py
+################################################################################
+
+import unittest
+import numpy as np
+from src.models.automata import AutomataModel, TimeSeriesSymbolizer
+
+class TestLevenshteinDistance(unittest.TestCase):
+    def setUp(self):
+        self.automata = AutomataModel(window_size=3)
+        self.automata.known_states = {"aab", "abc", "bcc"}
+
+    def test_identical_strings(self):
+        self.assertEqual(self.automata._levenshtein_distance("abc", "abc"), 0)
+
+    def test_empty_strings(self):
+        self.assertEqual(self.automata._levenshtein_distance("", "abc"), 3)
+
+    def test_sax_patterns(self):
+        self.assertEqual(self.automata._levenshtein_distance("aab", "abc"), 2)
+
+    def test_single_char_difference(self):
+        self.assertEqual(self.automata._levenshtein_distance("aab", "aac"), 1)
+
+class TestUnseenMapping(unittest.TestCase):
+    def setUp(self):
+        self.automata = AutomataModel(window_size=3)
+        self.automata.known_states = {"aab", "abc", "bcc"}
+
+    def test_map_nearest(self):
+        nearest, distance = self.automata._map_unseen_pattern("aac")
+        self.assertIn(nearest, ["aab", "abc"])
+        self.assertEqual(distance, 1)
+
+class TestSAXTransform(unittest.TestCase):
+    def test_fit_creates_bins(self):
+        symbolizer = TimeSeriesSymbolizer(paa_size=1, alphabet_size=3)
+        symbolizer.fit(np.array([1.0, 2.0, 3.0, 4.0]))
+        self.assertEqual(len(symbolizer.bins), 2)
+
+    def test_transform_returns_string(self):
+        symbolizer = TimeSeriesSymbolizer(paa_size=1, alphabet_size=3)
+        data = np.array([1.0, 2.0, 3.0])
+        symbolizer.fit(data)
+        self.assertIsInstance(symbolizer.transform(data), str)
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+################################################################################
+### DOSYA YOLU: tests/test_data_prep.py
+################################################################################
+
+import unittest
+import pandas as pd
+import numpy as np
+from src.data.preprocessor import DataTransformer
+
+class TestDataPrep(unittest.TestCase):
+    def test_data_transformer_fit_transform(self):
+        """Verilerin doğru standardize edildiği test edilir."""
+        df = pd.DataFrame({'sensor1': [1.0, 2.0, 3.0], 'sensor2': [4.0, 5.0, 6.0]})
+        transformer = DataTransformer(config_path="configs/config.yaml")
+        # Sadece hata fırlatıp fırlatmadığına bakılır, scaler mantığı
+        df_scaled, np_scaled = transformer.fit_transform(df)
+        self.assertEqual(df_scaled.shape[0], df.shape[0])
+        self.assertEqual(np_scaled.shape[0], df.shape[0])
+
+    def test_transformer_transform(self):
+        """Fit olmadan transform edilirse ValueError vermemelidir çünkü dummy scaler kurulur."""
+        df = pd.DataFrame({'sensor1': [10.0, 20.0]})
+        transformer = DataTransformer(config_path="configs/config.yaml")
+        transformer.fit_transform(df)
+        df_test = pd.DataFrame({'sensor1': [15.0, 25.0]})
+        df_out, np_out = transformer.transform(df_test)
+        self.assertEqual(df_out.shape[0], df_test.shape[0])
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+################################################################################
+### DOSYA YOLU: tests/test_dl_models.py
+################################################################################
+
+import unittest
+import torch
+from src.models.dl_models import build_dl_model
+
+class TestDLModels(unittest.TestCase):
+    def setUp(self):
+        self.batch_size = 4
+        self.seq_len = 5
+        self.input_size = 3
+        # Dummy Input: (batch, seq_len, input_size)
+        self.dummy_input = torch.randn(self.batch_size, self.seq_len, self.input_size)
+        
+        # Test için geçici config
+        self.config = {
+            "deep_learning": {
+                "lstm_hidden": 16,
+                "lstm_layers": 1,
+                "gru_hidden": 16,
+                "gru_layers": 1,
+                "cnn_filters": 16,
+                "cnn_kernel": 2,
+                "dropout": 0.1
+            }
+        }
+
+    def test_lstm_forward(self):
+        """LSTM modelinin ileri yayılımının çökmeden çalıştığı test edilir."""
+        model = build_dl_model("lstm", input_size=self.input_size, config=self.config)
+        output = model(self.dummy_input)
+        # Binary Classification output shape: (batch_size, 2)
+        self.assertEqual(output.shape, (self.batch_size, 2))
+
+    def test_gru_forward(self):
+        """GRU modelinin ileri yayılımının çökmeden çalıştığı test edilir."""
+        model = build_dl_model("gru", input_size=self.input_size, config=self.config)
+        output = model(self.dummy_input)
+        self.assertEqual(output.shape, (self.batch_size, 2))
+
+    def test_cnn_forward(self):
+        """CNN_1D modelinin ileri yayılımının çökmeden çalıştığı test edilir."""
+        model = build_dl_model("cnn_1d", input_size=self.input_size, config=self.config)
+        output = model(self.dummy_input)
+        self.assertEqual(output.shape, (self.batch_size, 2))
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+################################################################################
+### DOSYA YOLU: tests/test_pipeline_and_stats.py
+################################################################################
+
+import unittest
+from scipy.stats import wilcoxon
+
+class TestPipelineStats(unittest.TestCase):
+    def test_wilcoxon_test(self):
+        """İki modelin F1 skorları arasındaki anlamlılık testinin çökmediğini doğrular."""
+        # Sahte skor listeleri
+        m1_scores = [0.85, 0.86, 0.84, 0.88, 0.89]
+        m2_scores = [0.75, 0.74, 0.78, 0.76, 0.72]
+        
+        w_stat, p_val = wilcoxon(m1_scores, m2_scores, zero_method="zsplit")
+        # Wilcoxon sonucu p-value döndürmelidir.
+        self.assertIsNotNone(p_val)
+
+    def test_wilcoxon_identical_scores(self):
+        """Aynı skorlar verildiğinde de çökme olmamalıdır (Zero difference durumu)."""
+        m1_scores = [0.85, 0.85, 0.85]
+        m2_scores = [0.85, 0.85, 0.85]
+        w_stat, p_val = wilcoxon(m1_scores, m2_scores, zero_method="zsplit")
+        self.assertIsNotNone(p_val)
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+################################################################################
+### DOSYA YOLU: configs/config.yaml
+################################################################################
+
+experiment:
+  random_seeds: [42, 123, 2026, 7, 999]
+  log_dir: "logs"
+  output_dir: "outputs"
+
+data:
+  skab:
+    raw_dir: "data/raw/SKAB"
+    processed_dir: "data/processed/SKAB"
+    group_col: "source_file"
+    target_col: "anomaly"
+    folders: ["valve1", "valve2"]
+  batadal:
+    file_path: "data/raw/BATADAL/Training_Dataset_2.csv"
+    processed_dir: "data/processed/BATADAL"
+    train_ratio: 0.6
+    val_ratio: 0.2
+    test_ratio: 0.2
+    target_col: "ATT_FLAG"
+
+preprocessing:
+  scaler: "StandardScaler"
+  pca_n_components: 1
+
+deep_learning:
+  max_epochs: 50
+  batch_size: 32
+  learning_rate: 0.001
+  early_stopping_patience: 5
+  models:
+    lstm:
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.2
+    gru:
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.2
+    cnn_1d:
+      out_channels: 64
+      kernel_size: 3
+      dropout: 0.2
+
+automata:
+  paa_size: 4
+  sax_alphabet_size: 3
+  window_size: 4
+  anomaly_threshold: 0.05
+  noise_std: 0.1
+  parameter_variations:
+    window_sizes: [3, 4, 5, 6]
+    alphabet_sizes: [3, 4, 5, 6]
+
+
+################################################################################
+### DOSYA YOLU: src/__init__.py
+################################################################################
+
+# src package
+
+
+################################################################################
+### DOSYA YOLU: src/pipeline.py
+################################################################################
+
+import os
+import yaml
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from src.data.preprocessor import SKABPreprocessor, BATADALPreprocessor, DataTransformer
+from src.data.dataset import create_dataloaders
+from src.models.dl_models import build_dl_model
+from src.models.trainer import ModelTrainer
+from src.models.automata import TimeSeriesSymbolizer, AutomataModel
+from src.utils.metrics import compute_metrics, aggregate_seed_results, save_explainability_log
+
+
+def set_seed(seed: int):
+    """Tekrarlanabilirlik için tüm random seed'leri ayarlar."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+class TimeSeriesPipeline:
+    """Zaman Serilerinde Anomali Tespiti projesini uçtan uca yöneten orkestratör sınıf."""
+
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.config = yaml.safe_load(f)
+
+        self.seeds = self.config.get("experiment", {}).get("random_seeds", [42, 123, 2026, 7, 999])
+        self.output_dir = self.config.get("experiment", {}).get("output_dir", "outputs")
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.config.get("experiment", {}).get("log_dir", "logs"), exist_ok=True)
+
+    # ==================== BATADAL Pipeline ====================
+
+    def run_batadal_pipeline(self) -> dict:
+        """BATADAL veri seti üzerinde tüm modelleri tüm seed'lerle çalıştırır."""
+        preprocessor = BATADALPreprocessor(self.config_path)
+        X_train, y_train, X_val, y_val, X_test, y_test = preprocessor.load_and_split_data()
+
+        if X_train.empty:
+            return {}
+
+        all_results = {}
+
+        # --- DL Modelleri ---
+        for model_name in ["lstm", "gru", "cnn_1d"]:
+            seed_metrics = []
+            for seed_idx, seed in enumerate(self.seeds):
+                print(f"BATADAL - {model_name} eğitiliyor (Seed {seed_idx+1}/{len(self.seeds)})...")
+                set_seed(seed)
+                transformer = DataTransformer(self.config_path)
+
+                X_train_dl, _ = transformer.fit_transform(X_train)
+                X_val_dl, _ = transformer.transform(X_val)
+                X_test_dl, _ = transformer.transform(X_test)
+
+                window_size = self.config.get("automata", {}).get("window_size", 4)
+                batch_size = self.config.get("deep_learning", {}).get("batch_size", 32)
+
+                train_loader, val_loader, test_loader = create_dataloaders(
+                    X_train_dl,
+                    y_train,
+                    X_val_dl,
+                    y_val,
+                    X_test_dl,
+                    y_test,
+                    window_size=window_size,
+                    batch_size=batch_size,
+                )
+
+                input_size = X_train_dl.shape[1]
+                model = build_dl_model(model_name, input_size, self.config)
+
+                optimizer = optim.Adam(
+                    model.parameters(),
+                    lr=self.config.get("deep_learning", {}).get("learning_rate", 0.001),
+                )
+                criterion = nn.CrossEntropyLoss()
+
+                trainer = ModelTrainer(
+                    model, train_loader, val_loader, criterion, optimizer, self.config
+                )
+                trained_model = trainer.train()
+
+                # Test üzerinde tahmin
+                y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader)
+                metrics = compute_metrics(y_true_aligned, y_pred)
+                seed_metrics.append(metrics)
+
+            all_results[model_name] = aggregate_seed_results(seed_metrics)
+            all_results[model_name]["raw_seed_f1"] = [m.get("f1_score", 0) for m in seed_metrics]
+
+        # --- Automata Modeli ---
+        automata_seed_metrics = []
+        automata_explanations = []
+        for seed_idx, seed in enumerate(self.seeds):
+            print(f"BATADAL - automata eğitiliyor (Seed {seed_idx+1}/{len(self.seeds)})...")
+            set_seed(seed)
+            transformer = DataTransformer(self.config_path)
+            _, X_train_auto = transformer.fit_transform(X_train)
+            _, X_test_auto = transformer.transform(X_test)
+
+            paa_size = self.config.get("automata", {}).get("paa_size", 4)
+            alphabet_size = self.config.get("automata", {}).get("sax_alphabet_size", 3)
+            window_size = self.config.get("automata", {}).get("window_size", 4)
+            anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
+
+            symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
+            automata = AutomataModel(window_size=window_size)
+
+            X_train_1d = X_train_auto.flatten()
+            symbolizer.fit(X_train_1d)
+            sax_train = symbolizer.transform(X_train_1d)
+            automata.fit(sax_train)
+
+            X_test_1d = X_test_auto.flatten()
+            sax_test = symbolizer.transform(X_test_1d)
+
+            predictions = automata.predict_labels(sax_test, anomaly_threshold)
+            explanations = automata.predict_and_explain(sax_test, anomaly_threshold)
+
+            # Automata çıktısı DL window'lu çıktıdan farklı uzunlukta olabileceğinden
+            # y_test'i uygun şekilde kırpıyoruz
+            n_preds = len(predictions)
+            y_test_arr = np.array(y_test)
+            if n_preds < len(y_test_arr):
+                y_aligned = y_test_arr[:n_preds]
+            else:
+                y_aligned = y_test_arr
+
+            metrics = compute_metrics(y_aligned, predictions[: len(y_aligned)])
+            automata_seed_metrics.append(metrics)
+            automata_explanations = explanations
+
+        all_results["automata"] = aggregate_seed_results(automata_seed_metrics)
+        all_results["automata"]["raw_seed_f1"] = [
+            m.get("f1_score", 0) for m in automata_seed_metrics
+        ]
+
+        # Açıklanabilirlik loglarını kaydet
+        save_explainability_log(
+            automata_explanations, os.path.join(self.output_dir, "batadal_explainability.json")
+        )
+
+        return all_results
+
+    # ==================== SKAB Pipeline ====================
+
+    def run_skab_pipeline(self) -> dict:
+        """SKAB veri seti üzerinde GroupKFold ile tüm modelleri çalıştırır."""
+        preprocessor = SKABPreprocessor(self.config_path)
+        X, y, groups = preprocessor.load_and_merge_data()
+
+        if X.empty:
+            return {}
+
+        splits = preprocessor.get_group_kfold_splits(X, y, groups, n_splits=5)
+        all_results = {}
+
+        # --- DL Modelleri ---
+        for model_name in ["lstm", "gru", "cnn_1d"]:
+            seed_metrics = []
+            for seed in self.seeds:
+                fold_metrics = []
+                for fold_idx, (train_idx, test_idx) in enumerate(splits):
+                    print(f"SKAB - {model_name} eğitiliyor (Seed {seed}, Fold {fold_idx+1}/{len(splits)})...")
+                    set_seed(seed)
+
+                    X_train_fold = X.iloc[train_idx]
+                    y_train_fold = y.iloc[train_idx]
+                    X_test_fold = X.iloc[test_idx]
+                    y_test_fold = y.iloc[test_idx]
+
+                    # Train'i %80 train %20 val olarak böl
+                    n_train = len(X_train_fold)
+                    val_split = int(n_train * 0.8)
+                    X_tr = X_train_fold.iloc[:val_split]
+                    y_tr = y_train_fold.iloc[:val_split]
+                    X_vl = X_train_fold.iloc[val_split:]
+                    y_vl = y_train_fold.iloc[val_split:]
+
+                    transformer = DataTransformer(self.config_path)
+                    X_tr_dl, _ = transformer.fit_transform(X_tr)
+                    X_vl_dl, _ = transformer.transform(X_vl)
+                    X_te_dl, _ = transformer.transform(X_test_fold)
+
+                    window_size = self.config.get("automata", {}).get("window_size", 4)
+                    batch_size = self.config.get("deep_learning", {}).get("batch_size", 32)
+
+                    train_loader, val_loader, test_loader = create_dataloaders(
+                        X_tr_dl,
+                        y_tr,
+                        X_vl_dl,
+                        y_vl,
+                        X_te_dl,
+                        y_test_fold,
+                        window_size=window_size,
+                        batch_size=batch_size,
+                    )
+
+                    input_size = X_tr_dl.shape[1]
+                    model = build_dl_model(model_name, input_size, self.config)
+
+                    optimizer = optim.Adam(
+                        model.parameters(),
+                        lr=self.config.get("deep_learning", {}).get("learning_rate", 0.001),
+                    )
+                    criterion = nn.CrossEntropyLoss()
+                    trainer = ModelTrainer(
+                        model, train_loader, val_loader, criterion, optimizer, self.config
+                    )
+                    trained_model = trainer.train()
+
+                    y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader)
+                    metrics = compute_metrics(y_true_aligned, y_pred)
+                    fold_metrics.append(metrics)
+
+                # Fold ortalaması
+                avg_fold = aggregate_seed_results(fold_metrics)
+                seed_metrics.append({k: v["mean"] for k, v in avg_fold.items()})
+
+            all_results[model_name] = aggregate_seed_results(seed_metrics)
+            all_results[model_name]["raw_seed_f1"] = [m.get("f1_score", 0) for m in seed_metrics]
+
+        # --- Automata Modeli ---
+        automata_seed_metrics = []
+        for seed in self.seeds:
+            fold_metrics = []
+            for fold_idx, (train_idx, test_idx) in enumerate(splits):
+                print(f"SKAB - automata eğitiliyor (Seed {seed}, Fold {fold_idx+1}/{len(splits)})...")
+                set_seed(seed)
+
+                X_train_fold = X.iloc[train_idx]
+                X_test_fold = X.iloc[test_idx]
+                y_test_fold = y.iloc[test_idx]
+
+                transformer = DataTransformer(self.config_path)
+                _, X_train_auto = transformer.fit_transform(X_train_fold)
+                _, X_test_auto = transformer.transform(X_test_fold)
+
+                paa_size = self.config.get("automata", {}).get("paa_size", 4)
+                alphabet_size = self.config.get("automata", {}).get("sax_alphabet_size", 3)
+                window_size = self.config.get("automata", {}).get("window_size", 4)
+                anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
+
+                symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
+                automata = AutomataModel(window_size=window_size)
+
+                X_train_1d = X_train_auto.flatten()
+                symbolizer.fit(X_train_1d)
+                sax_train = symbolizer.transform(X_train_1d)
+                automata.fit(sax_train)
+
+                X_test_1d = X_test_auto.flatten()
+                sax_test = symbolizer.transform(X_test_1d)
+
+                predictions = automata.predict_labels(sax_test, anomaly_threshold)
+
+                n_preds = len(predictions)
+                y_test_arr = np.array(y_test_fold)
+                if n_preds < len(y_test_arr):
+                    y_aligned = y_test_arr[:n_preds]
+                else:
+                    y_aligned = y_test_arr
+
+                metrics = compute_metrics(y_aligned, predictions[: len(y_aligned)])
+                fold_metrics.append(metrics)
+
+            avg_fold = aggregate_seed_results(fold_metrics)
+            automata_seed_metrics.append({k: v["mean"] for k, v in avg_fold.items()})
+
+        all_results["automata"] = aggregate_seed_results(automata_seed_metrics)
+        all_results["automata"]["raw_seed_f1"] = [
+            m.get("f1_score", 0) for m in automata_seed_metrics
+        ]
+        return all_results
+
+    # ==================== Gürültü Deneyi ====================
+
+    def run_noise_experiment(self, dataset_name: str = "batadal") -> dict:
+        """Gaussian gürültü eklenmiş veri üzerinde model performansını test eder."""
+        noise_std = self.config.get("automata", {}).get("noise_std", 0.1)
+
+        if dataset_name == "batadal":
+            preprocessor = BATADALPreprocessor(self.config_path)
+            X_train, y_train, X_val, y_val, X_test, y_test = preprocessor.load_and_split_data()
+            if X_train.empty:
+                return {}
+
+            # Test verisine Gaussian gürültü ekle
+            np.random.seed(42)
+            X_test_noisy = X_test.copy()
+            noise = np.random.normal(0, noise_std, X_test_noisy.shape)
+            X_test_noisy = X_test_noisy + noise
+
+            results = {}
+            for model_name in ["lstm", "gru", "cnn_1d"]:
+                seed = self.seeds[0]
+                set_seed(seed)
+
+                transformer = DataTransformer(self.config_path)
+                X_train_dl, _ = transformer.fit_transform(X_train)
+                X_val_dl, _ = transformer.transform(X_val)
+                X_test_dl, _ = transformer.transform(X_test_noisy)
+
+                window_size = self.config.get("automata", {}).get("window_size", 4)
+                batch_size = self.config.get("deep_learning", {}).get("batch_size", 32)
+
+                train_loader, val_loader, test_loader = create_dataloaders(
+                    X_train_dl,
+                    y_train,
+                    X_val_dl,
+                    y_val,
+                    X_test_dl,
+                    y_test,
+                    window_size=window_size,
+                    batch_size=batch_size,
+                )
+
+                input_size = X_train_dl.shape[1]
+                model = build_dl_model(model_name, input_size, self.config)
+                optimizer = optim.Adam(
+                    model.parameters(),
+                    lr=self.config.get("deep_learning", {}).get("learning_rate", 0.001),
+                )
+                criterion = nn.CrossEntropyLoss()
+                trainer = ModelTrainer(
+                    model, train_loader, val_loader, criterion, optimizer, self.config
+                )
+                trained_model = trainer.train()
+
+                y_pred, y_true_aligned = self._predict_dl(trained_model, test_loader)
+                results[model_name] = compute_metrics(y_true_aligned, y_pred)
+
+            # Automata noise
+            set_seed(42)
+            transformer = DataTransformer(self.config_path)
+            _, X_train_auto = transformer.fit_transform(X_train)
+            _, X_test_auto = transformer.transform(X_test_noisy)
+
+            paa_size = self.config.get("automata", {}).get("paa_size", 4)
+            alphabet_size = self.config.get("automata", {}).get("sax_alphabet_size", 3)
+            window_size = self.config.get("automata", {}).get("window_size", 4)
+            anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
+
+            symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=alphabet_size)
+            automata_model = AutomataModel(window_size=window_size)
+            symbolizer.fit(X_train_auto.flatten())
+            sax_train = symbolizer.transform(X_train_auto.flatten())
+            automata_model.fit(sax_train)
+
+            sax_test = symbolizer.transform(X_test_auto.flatten())
+            preds = automata_model.predict_labels(sax_test, anomaly_threshold)
+            y_test_arr = np.array(y_test)
+            preds = preds[: len(y_test_arr)]
+            y_aligned = y_test_arr[: len(preds)]
+            results["automata"] = compute_metrics(y_aligned, preds)
+
+            return results
+
+        return {}
+
+    # ==================== Parametre Varyasyonu ====================
+
+    def run_parameter_variation(self, dataset_name: str = "batadal") -> dict:
+        """window_size ve alphabet_size varyasyonlarının automata performansına etkisini analiz eder."""
+        variations = self.config.get("automata", {}).get("parameter_variations", {})
+        window_sizes = variations.get("window_sizes", [3, 4, 5, 6])
+        alphabet_sizes = variations.get("alphabet_sizes", [3, 4, 5, 6])
+
+        if dataset_name == "batadal":
+            preprocessor = BATADALPreprocessor(self.config_path)
+            X_train, y_train, X_val, y_val, X_test, y_test = preprocessor.load_and_split_data()
+            if X_train.empty:
+                return {}
+
+            set_seed(42)
+            transformer = DataTransformer(self.config_path)
+            _, X_train_auto = transformer.fit_transform(X_train)
+            _, X_test_auto = transformer.transform(X_test)
+
+            results = {"window_size": {}, "alphabet_size": {}}
+            anomaly_threshold = self.config.get("automata", {}).get("anomaly_threshold", 0.05)
+
+            # Window size varyasyonu (alphabet sabit = 3)
+            for ws in window_sizes:
+                paa_size = self.config.get("automata", {}).get("paa_size", 4)
+                symbolizer = TimeSeriesSymbolizer(paa_size=paa_size, alphabet_size=3)
+                automata = AutomataModel(window_size=ws)
+
+                symbolizer.fit(X_train_auto.flatten())
+                sax_train = symbolizer.transform(X_train_auto.flatten())
+                automata.fit(sax_train)
+
+                sax_test = symbolizer.transform(X_test_auto.flatten())
+                preds = automata.predict_labels(sax_test, anomaly_threshold)
+
+                y_test_arr = np.array(y_test)
+                preds = preds[: len(y_test_arr)]
+                y_aligned = y_test_arr[: len(preds)]
+
+                metrics = compute_metrics(y_aligned, preds)
+                metrics["state_count"] = automata.get_state_count()
+                metrics["transition_density"] = automata.get_transition_density()
+                results["window_size"][ws] = metrics
+
+            # Alphabet size varyasyonu (window sabit = 4)
+            for als in alphabet_sizes:
+                symbolizer = TimeSeriesSymbolizer(paa_size=4, alphabet_size=als)
+                automata = AutomataModel(window_size=4)
+
+                symbolizer.fit(X_train_auto.flatten())
+                sax_train = symbolizer.transform(X_train_auto.flatten())
+                automata.fit(sax_train)
+
+                sax_test = symbolizer.transform(X_test_auto.flatten())
+                preds = automata.predict_labels(sax_test, anomaly_threshold)
+
+                y_test_arr = np.array(y_test)
+                preds = preds[: len(y_test_arr)]
+                y_aligned = y_test_arr[: len(preds)]
+
+                metrics = compute_metrics(y_aligned, preds)
+                metrics["state_count"] = automata.get_state_count()
+                metrics["transition_density"] = automata.get_transition_density()
+                results["alphabet_size"][als] = metrics
+
+            return results
+
+        return {}
+
+    # ==================== Yardımcı Metotlar ====================
+
+    @staticmethod
+    def _predict_dl(model, test_loader) -> tuple:
+        """DL modelinin test loader üzerindeki tahminlerini ve gerçek etiketlerini döner."""
+        device = next(model.parameters()).device
+        model.eval()
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
+            for X_batch, y_batch in test_loader:
+                X_batch = X_batch.to(device)
+                outputs = model(X_batch)
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(y_batch.numpy())
+
+        return np.array(all_preds), np.array(all_labels)
+
+
+################################################################################
+### DOSYA YOLU: src/utils/__init__.py
+################################################################################
+
+# src.utils package
+
+
+################################################################################
+### DOSYA YOLU: src/utils/metrics.py
+################################################################################
+
+import json
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+)
+
+
+def compute_metrics(y_true, y_pred) -> dict:
+    """Accuracy, Precision, Recall, F1-score hesaplar ve dict olarak döner."""
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    return {
+        "accuracy": round(float(accuracy_score(y_true, y_pred)), 6),
+        "precision": round(float(precision_score(y_true, y_pred, zero_division=0)), 6),
+        "recall": round(float(recall_score(y_true, y_pred, zero_division=0)), 6),
+        "f1_score": round(float(f1_score(y_true, y_pred, zero_division=0)), 6),
+    }
+
+
+def compute_confusion_matrix(y_true, y_pred) -> np.ndarray:
+    """Confusion matrix hesaplar."""
+    return confusion_matrix(y_true, y_pred)
+
+
+def compute_classification_report(y_true, y_pred) -> str:
+    """Detaylı sınıflandırma raporu döner."""
+    return classification_report(
+        y_true, y_pred, target_names=["Normal", "Anomaly"], zero_division=0
+    )
+
+
+def aggregate_seed_results(all_seed_metrics: list) -> dict:
+    """Birden fazla seed sonucunun ortalamasını ve standart sapmasını hesaplar."""
+    if not all_seed_metrics:
+        return {}
+
+    keys = all_seed_metrics[0].keys()
+    aggregated = {}
+
+    for key in keys:
+        values = [m[key] for m in all_seed_metrics]
+        aggregated[key] = {
+            "mean": round(float(np.mean(values)), 6),
+            "std": round(float(np.std(values)), 6),
+        }
+
+    return aggregated
+
+
+def save_explainability_log(results: list, output_path: str):
+    """Pipeline'dan dönen açıklanabilirlik log listesini JSON formatında kaydeder."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=4)
+
+
+def save_experiment_results(results: dict, output_path: str):
+    """Deney sonuçlarını JSON formatında kaydeder."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=4, default=str)
+
+
+################################################################################
+### DOSYA YOLU: src/utils/visualization.py
+################################################################################
+
+import os
+import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+import networkx as nx
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+
+def plot_confusion_matrix(cm, title="Confusion Matrix", save_path=None):
+    """Confusion matrix'i matplotlib ile çizer ve kaydeder."""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=["Normal", "Anomaly"],
+        yticklabels=["Normal", "Anomaly"],
+        ax=ax,
+    )
+    ax.set_xlabel("Tahmin Edilen")
+    ax.set_ylabel("Gerçek")
+    ax.set_title(title)
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_roc_curve(y_true, y_scores, title="ROC Curve", save_path=None):
+    """ROC eğrisini çizer."""
+    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    roc_auc = auc(fpr, tpr)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC (AUC = {roc_auc:.4f})")
+    ax.plot([0, 1], [0, 1], color="navy", lw=1, linestyle="--")
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_precision_recall_curve(y_true, y_scores, title="Precision-Recall Curve", save_path=None):
+    """Precision-Recall eğrisini çizer."""
+    precision, recall, _ = precision_recall_curve(y_true, y_scores)
+    avg_precision = average_precision_score(y_true, y_scores)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(recall, precision, color="green", lw=2, label=f"AP = {avg_precision:.4f}")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(title)
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_transition_heatmap(
+    transition_matrix: dict, title="Transition Probability Heatmap", save_path=None
+):
+    """Geçiş olasılık matrisini heatmap olarak çizer."""
+    states = sorted(
+        set(
+            list(transition_matrix.keys())
+            + [s for v in transition_matrix.values() for s in v.keys()]
+        )
+    )
+
+    if len(states) > 30:
+        states = sorted(transition_matrix.keys())[:30]
+
+    n = len(states)
+    matrix = np.zeros((n, n))
+    state_idx = {s: i for i, s in enumerate(states)}
+
+    for src, targets in transition_matrix.items():
+        if src not in state_idx:
+            continue
+        for tgt, prob in targets.items():
+            if tgt in state_idx:
+                matrix[state_idx[src]][state_idx[tgt]] = prob
+
+    fig, ax = plt.subplots(figsize=(max(8, n * 0.5), max(6, n * 0.4)))
+    sns.heatmap(
+        matrix,
+        xticklabels=states,
+        yticklabels=states,
+        cmap="YlOrRd",
+        annot=(n <= 15),
+        fmt=".2f",
+        ax=ax,
+    )
+    ax.set_xlabel("Hedef State")
+    ax.set_ylabel("Kaynak State")
+    ax.set_title(title)
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_parameter_sensitivity(
+    results_dict: dict, param_name: str, metric_name: str = "f1_score", title=None, save_path=None
+):
+    """Parametre duyarlılık grafiği çizer. F1-score ve State Count içerir."""
+    if title is None:
+        title = f"{param_name} Sensitivity"
+
+    param_values = sorted(results_dict.keys())
+    x_labels = [str(p) for p in param_values]
+    metric_values = [results_dict[p].get(metric_name, 0) for p in param_values]
+    state_counts = [results_dict[p].get("state_count", 0) for p in param_values]
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+
+    color = "tab:blue"
+    ax1.set_xlabel(param_name)
+    ax1.set_ylabel(metric_name, color=color)
+    ax1.plot(x_labels, metric_values, marker="o", linewidth=2, markersize=8, color=color)
+    ax1.tick_params(axis="y", labelcolor=color)
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    color = "tab:red"
+    ax2.set_ylabel("State Count", color=color)
+    ax2.bar(x_labels, state_counts, alpha=0.3, color=color, width=0.4)
+    ax2.tick_params(axis="y", labelcolor=color)
+
+    plt.title(title)
+    fig.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_model_comparison(
+    results: dict, metric_name: str = "f1_score", title="Model Karşılaştırması", save_path=None
+):
+    """Tüm modellerin bir metriğini bar chart olarak karşılaştırır."""
+    model_names = list(results.keys())
+    values = [results[m].get(metric_name, 0) for m in model_names]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(model_names, values, color=["#2196F3", "#4CAF50", "#FF9800", "#E91E63"])
+    ax.set_ylabel(metric_name)
+    ax.set_title(title)
+    ax.set_ylim(0, 1.05)
+
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 0.01,
+            f"{val:.4f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_automata_state_diagram(transition_matrix: dict, title="Automata State Diagram", save_path=None):
+    """NetworkX ile State Geçiş Grafiği Çizer."""
+    
+    G = nx.DiGraph()
+    for src, targets in transition_matrix.items():
+        for tgt, prob in targets.items():
+            if prob > 0.05:
+                G.add_edge(src, tgt, weight=prob)
+                
+    fig, ax = plt.subplots(figsize=(10, 8))
+    pos = nx.spring_layout(G, k=0.5, seed=42)
+    
+    nx.draw(G, pos, ax=ax, with_labels=True, node_color='lightblue', 
+            node_size=1500, font_size=9, font_weight='bold', 
+            edge_color='gray', arrows=True)
+            
+    edge_labels = {(u, v): f"{d['weight']:.2f}" for u, v, d in G.edges(data=True)}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+    
+    ax.set_title(title)
+    
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+################################################################################
+### DOSYA YOLU: src/models/__init__.py
+################################################################################
+
+# src.models package
+
+
+################################################################################
+### DOSYA YOLU: src/models/automata.py
+################################################################################
+
+import numpy as np
+
+
+class TimeSeriesSymbolizer:
+    """Zaman serilerini ayrık sembollere (SAX) ve sıkıştırılmış formlara (PAA) dönüştüren sınıf."""
+
+    def __init__(self, paa_size: int = 4, alphabet_size: int = 3):
+        self.paa_size = paa_size
+        self.alphabet_size = alphabet_size
+        self.bins = None
+
+    def _apply_paa(self, data_1d: np.ndarray) -> np.ndarray:
+        """1 boyutlu diziyi paa_size büyüklüğündeki parçalara böler ve ortalamalarını alır."""
+        n = len(data_1d)
+        remainder = n % self.paa_size
+        valid_n = n - remainder
+
+        if valid_n == 0:
+            return np.array([np.mean(data_1d)])
+
+        reshaped_data = data_1d[:valid_n].reshape(-1, self.paa_size)
+        paa_means = np.mean(reshaped_data, axis=1)
+
+        if remainder > 0:
+            last_mean = np.mean(data_1d[valid_n:])
+            paa_means = np.append(paa_means, last_mean)
+
+        return paa_means
+
+    def fit(self, X_train_1d: np.ndarray):
+        """Eğitim verisinden PAA uygulayarak SAX eşik değerlerini öğrenir."""
+        paa_data = self._apply_paa(X_train_1d)
+        percentiles = np.linspace(0, 100, self.alphabet_size + 1)[1:-1]
+        self.bins = np.percentile(paa_data, percentiles)
+
+    def transform(self, X_1d: np.ndarray) -> str:
+        """Yeni gelen veriyi PAA ile sıkıştırıp daha önce öğrenilen sınırlara göre harflere çevirir."""
+        if self.bins is None:
+            raise ValueError("Transform işleminden önce fit() çağrılmalıdır!")
+
+        paa_data = self._apply_paa(X_1d)
+        indices = np.digitize(paa_data, self.bins)
+        symbols = [chr(97 + i) for i in indices]
+        return "".join(symbols)
+
+
+class AutomataModel:
+    """SAX sembol dizilerinden durum çıkarımı ve olasılıksal matris inşası için sınıf."""
+
+    def __init__(self, window_size: int = 4):
+        self.window_size = window_size
+        self.transition_matrix = {}
+        self.known_states = set()
+
+    def _extract_patterns(self, sax_string: str) -> list:
+        """Uzun SAX karakter dizisini window_size uzunluğunda kayan pencerelere böler."""
+        patterns = []
+        n = len(sax_string)
+        if n < self.window_size:
+            return patterns
+        for i in range(n - self.window_size + 1):
+            pattern = sax_string[i : i + self.window_size]
+            patterns.append(pattern)
+        return patterns
+
+    def fit(self, sax_string_train: str, laplace_alpha: float = 1e-5):
+        """Eğitim verisinden Frekans Tabanlı Geçiş Olasılık Matrisi (TPM) oluşturur. Laplace Smoothing içerir."""
+        patterns = self._extract_patterns(sax_string_train)
+        self.known_states = set(patterns)
+        counts = {}
+
+        for i in range(len(patterns) - 1):
+            curr_state = patterns[i]
+            next_state = patterns[i + 1]
+
+            if curr_state not in counts:
+                counts[curr_state] = {}
+            if next_state not in counts[curr_state]:
+                counts[curr_state][next_state] = 0
+            counts[curr_state][next_state] += 1
+
+        n_states = len(self.known_states)
+        for curr_state, transitions in counts.items():
+            total_transitions = sum(transitions.values()) + (laplace_alpha * n_states)
+            self.transition_matrix[curr_state] = {}
+            for target_state in self.known_states:
+                count = transitions.get(target_state, 0)
+                prob = (count + laplace_alpha) / total_transitions
+                self.transition_matrix[curr_state][target_state] = prob
+
+    def _levenshtein_distance(self, s1: str, s2: str) -> int:
+        """Dinamik Programlama ile iki string arasındaki Minimum Edit Distance'ı hesaplar."""
+        m, n = len(s1), len(s2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+        for i in range(m + 1):
+            for j in range(n + 1):
+                if i == 0:
+                    dp[i][j] = j
+                elif j == 0:
+                    dp[i][j] = i
+                elif s1[i - 1] == s2[j - 1]:
+                    dp[i][j] = dp[i - 1][j - 1]
+                else:
+                    dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+        return dp[m][n]
+
+    def _map_unseen_pattern(self, unseen_pattern: str) -> tuple:
+        """Görülmemiş bir pattern'ı bilinen durumlara en yakın olanla eşler."""
+        if not self.known_states:
+            return None, float("inf")
+
+        nearest_pattern = None
+        min_distance = float("inf")
+
+        for known_state in self.known_states:
+            dist = self._levenshtein_distance(unseen_pattern, known_state)
+            if dist < min_distance:
+                min_distance = dist
+                nearest_pattern = known_state
+
+        return nearest_pattern, min_distance
+
+    def predict_and_explain(self, test_sax_string: str, anomaly_threshold: float = 0.05) -> list:
+        """
+        Test verisi üzerinde adım adım geçiş olasılıklarını hesaplar
+        ve açıklanabilir (explainable) JSON sonuçları üretir.
+
+        Çıktı formatı PDF gereksinimlerini karşılar:
+        - state, pattern, status, mapped_to
+        - transitions listesi
+        - probability (geçiş olasılığı)
+        - path_probability (kümülatif)
+        - confidence_score
+        - decision
+        """
+        patterns = self._extract_patterns(test_sax_string)
+        results = []
+
+        epsilon = 1e-5
+        cumulative_log_prob = 0.0
+
+        for i in range(len(patterns)):
+            raw_pattern = patterns[i]
+
+            # 1. Durum Kontrolü ve Haritalama
+            if raw_pattern in self.known_states:
+                status = "seen"
+                mapped_to = None
+                mapping_distance = 0
+                current_state = raw_pattern
+            else:
+                status = "unseen"
+                mapped_to, mapping_distance = self._map_unseen_pattern(raw_pattern)
+                current_state = mapped_to
+
+            # 2. Geçiş Olasılığı Hesabı
+            transition_prob = epsilon
+            transitions_detail = []
+
+            if i < len(patterns) - 1:
+                next_raw = patterns[i + 1]
+
+                if next_raw in self.known_states:
+                    next_state = next_raw
+                else:
+                    next_state = self._map_unseen_pattern(next_raw)[0]
+
+                # Mevcut state'in tüm geçişlerini listele (yalnızca ihtimali yüksek olanlar)
+                if current_state in self.transition_matrix:
+                    for target, prob in self.transition_matrix[current_state].items():
+                        if (
+                            prob > 1e-4
+                        ):  # Çok düşük (sadece laplace'dan gelen) olasılıkları filtrele
+                            transitions_detail.append(
+                                {"from": current_state, "to": target, "probability": round(prob, 6)}
+                            )
+                    transition_prob = self.transition_matrix[current_state].get(next_state, epsilon)
+            else:
+                transition_prob = 1.0
+
+            # 3. Path Probability (kümülatif, log-space underflow korumalı)
+            cumulative_log_prob += np.log(max(transition_prob, epsilon))
+            path_probability = float(np.exp(cumulative_log_prob))
+
+            # 4. Güven Skoru (Confidence Score)
+            # Yüksek geçiş olasılığı = yüksek güven
+            confidence_score = round(float(transition_prob), 6)
+
+            # 5. Anomali Kararı
+            decision = "anomaly" if transition_prob < anomaly_threshold else "normal"
+
+            step_result = {
+                "time_step": i,
+                "state": current_state,
+                "pattern": raw_pattern,
+                "status": status,
+                "mapped_to": mapped_to,
+                "mapping_distance": mapping_distance,
+                "transitions": transitions_detail,
+                "probability": round(float(transition_prob), 6),
+                "path_probability": round(path_probability, 10),
+                "confidence_score": confidence_score,
+                "decision": decision,
+            }
+            results.append(step_result)
+
+        return results
+
+    def predict_labels(self, test_sax_string: str, anomaly_threshold: float = 0.05) -> list:
+        """Test verisi için binary anomali etiketleri üretir (0: normal, 1: anomaly)."""
+        explanations = self.predict_and_explain(test_sax_string, anomaly_threshold)
+        return [1 if e["decision"] == "anomaly" else 0 for e in explanations]
+
+    def get_state_count(self) -> int:
+        """Eğitimde öğrenilen benzersiz durum (state) sayısını döner."""
+        return len(self.known_states)
+
+    def get_transition_density(self) -> float:
+        """Geçiş matrisinin yoğunluğunu (doluluk oranı) hesaplar."""
+        if not self.known_states:
+            return 0.0
+        n_states = len(self.known_states)
+        max_transitions = n_states * n_states
+        actual_transitions = sum(len(v) for v in self.transition_matrix.values())
+        return actual_transitions / max_transitions if max_transitions > 0 else 0.0
+
+
+################################################################################
+### DOSYA YOLU: src/models/dl_models.py
+################################################################################
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class AnomalyLSTM(nn.Module):
+    """Zaman serilerinde anomali tespiti için LSTM tabanlı Derin Öğrenme mimarisi."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float = 0.0):
+        super(AnomalyLSTM, self).__init__()
+        lstm_dropout = dropout if num_layers > 1 else 0.0
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 2)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last_hidden = out[:, -1, :]
+        last_hidden = self.dropout(last_hidden)
+        out = self.fc(last_hidden)
+        return out
+
+
+class AnomalyGRU(nn.Module):
+    """Zaman serilerinde anomali tespiti için GRU tabanlı Derin Öğrenme mimarisi."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float = 0.0):
+        super(AnomalyGRU, self).__init__()
+        gru_dropout = dropout if num_layers > 1 else 0.0
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=gru_dropout,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 2)
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        last_hidden = out[:, -1, :]
+        last_hidden = self.dropout(last_hidden)
+        out = self.fc(last_hidden)
+        return out
+
+
+class AnomalyCNN1D(nn.Module):
+    """Zaman serilerinde anomali tespiti için 1D-CNN mimarisi."""
+
+    def __init__(
+        self, num_features: int, hidden_channels: int, kernel_size: int, dropout: float = 0.0
+    ):
+        super(AnomalyCNN1D, self).__init__()
+        self.conv1 = nn.Conv1d(
+            in_channels=num_features,
+            out_channels=hidden_channels,
+            kernel_size=kernel_size,
+            padding="same",
+        )
+        self.conv2 = nn.Conv1d(
+            in_channels=hidden_channels,
+            out_channels=hidden_channels * 2,
+            kernel_size=kernel_size,
+            padding="same",
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_channels * 2, 2)
+
+    def forward(self, x):
+        # (batch, window, features) -> (batch, features, window) for Conv1d
+        x = x.permute(0, 2, 1)
+        x = F.relu(self.conv1(x))
+        x = self.dropout(x)
+        x = F.relu(self.conv2(x))
+        # Global Average Pooling
+        x = torch.mean(x, dim=2)
+        out = self.fc(x)
+        return out
+
+
+def build_dl_model(model_name: str, input_size: int, config: dict):
+    """Config'den model adına göre DL modeli oluşturur."""
+    models_config = config.get("deep_learning", {}).get("models", {})
+
+    if model_name == "lstm":
+        mc = models_config.get("lstm", {})
+        return AnomalyLSTM(
+            input_size=input_size,
+            hidden_size=mc.get("hidden_size", 64),
+            num_layers=mc.get("num_layers", 2),
+            dropout=mc.get("dropout", 0.2),
+        )
+    elif model_name == "gru":
+        mc = models_config.get("gru", {})
+        return AnomalyGRU(
+            input_size=input_size,
+            hidden_size=mc.get("hidden_size", 64),
+            num_layers=mc.get("num_layers", 2),
+            dropout=mc.get("dropout", 0.2),
+        )
+    elif model_name == "cnn_1d":
+        mc = models_config.get("cnn_1d", {})
+        return AnomalyCNN1D(
+            num_features=input_size,
+            hidden_channels=mc.get("out_channels", 64),
+            kernel_size=mc.get("kernel_size", 3),
+            dropout=mc.get("dropout", 0.2),
+        )
+    else:
+        raise ValueError(f"Bilinmeyen model adı: {model_name}")
+
+
+################################################################################
+### DOSYA YOLU: src/models/trainer.py
+################################################################################
+
+import torch
+import copy
+from pathlib import Path
+
+
+class ModelTrainer:
+    """Derin öğrenme modelleri için eğitim ve doğrulama döngüsünü (Early Stopping ile) yöneten sınıf."""
+
+    def __init__(self, model, train_loader, val_loader, criterion, optimizer, config: dict):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.criterion = criterion
+        self.optimizer = optimizer
+
+        # Hiperparametreleri config dosyasından okuma
+        dl_config = config.get("deep_learning", {})
+        self.max_epochs = dl_config.get("max_epochs", 50)
+        self.patience = dl_config.get("early_stopping_patience", 5)
+
+        # Model kayıt dizini
+        self.log_dir = Path(config.get("experiment", {}).get("log_dir", "logs"))
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.best_model_path = self.log_dir / "best_model.pth"
+
+        # Cihaz ayarı (CPU / GPU)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+    def train(self):
+        """Eğitim döngüsünü çalıştırır, early stopping uygular ve en iyi modeli döner."""
+        best_val_loss = float("inf")
+        patience_counter = 0
+        best_model_state = None
+
+        for epoch in range(self.max_epochs):
+            # --- Eğitim (Train) Aşaması ---
+            self.model.train()
+
+            for X_batch, y_batch in self.train_loader:
+                X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+
+                self.optimizer.zero_grad()
+                outputs = self.model(X_batch)
+
+                loss = self.criterion(outputs, y_batch)
+                loss.backward()
+                self.optimizer.step()
+
+            # --- Doğrulama (Validation) Aşaması ---
+            self.model.eval()
+            val_loss = 0.0
+
+            with torch.no_grad():
+                for X_batch, y_batch in self.val_loader:
+                    X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+
+                    outputs = self.model(X_batch)
+                    loss = self.criterion(outputs, y_batch)
+
+                    # Tüm batch'in loss toplamını bul
+                    val_loss += loss.item() * X_batch.size(0)
+
+            # Ortalama Validation Loss hesabı
+            val_loss /= len(self.val_loader.dataset)
+
+            # --- Early Stopping ve En İyi Modeli Kaydetme ---
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+
+                # Ağırlıkları hem hafızaya (deepcopy) hem de diske alıyoruz
+                best_model_state = copy.deepcopy(self.model.state_dict())
+                try:
+                    torch.save(best_model_state, self.best_model_path)
+                except Exception:
+                    pass
+            else:
+                patience_counter += 1
+
+            # Belirlenen epoch boyunca iyileşme olmadıysa döngüyü bitir
+            if patience_counter >= self.patience:
+                break
+
+        # Döngü bitiminde elde edilen en iyi ağırlıkları modele geri yükle
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+
+        return self.model

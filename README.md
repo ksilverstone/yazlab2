@@ -77,49 +77,52 @@ yazlab2/
 
 ## 5. Deney Sonuçları (Bizim SKAB & BATADAL Sonuçlarımız)
 
-Bizzat çalıştırdığımız 15 dakikalık Derin Öğrenme Pipeline testinde elde ettiğimiz resmi bulgularımız aşağıdaki tablolarda listelenmiştir.
+Aşağıdaki tablolar, modellerin kendi sistemimizde test edilmesiyle elde edilen resmi F1 skorlarını, gürültü dirençlerini ve çalışma sürelerini göstermektedir. Değerler PDF EK şablonuna göre düzenlenmiştir.
 
-### Tablo 1: Model F1 Performansları (SKAB GroupKFold)
+### 5.1 Temel Performans ve Stabilite
+**Tablo 1:** Model Performansı ve Stabilitesi (Ortalama F1-score ± Standart Sapma)
 
-| Model        | SKAB Başarı Oranı (F1-Score)    | BATADAL Başarı Oranı (F1-Score) |
-| ------------ | ------------------------------- | ------------------------------- |
-| **GRU**      | **0.8389 ± 0.0083** (🏆 En İyi) | 0.1252 ± 0.2504                 |
-| **LSTM**     | 0.8327 ± 0.0056                 | 0.0000 ± 0.0000                 |
-| **1D-CNN**   | 0.8256 ± 0.0105                 | 0.0000 ± 0.0000                 |
-| **Automata** | 0.0431 ± 0.0000                 | 0.0909 ± 0.0000                 |
+| Model | SKAB | BATADAL |
+|---|---|---|
+| **LSTM** | 0.8327 ± 0.005 | 0.0000 ± 0.000 |
+| **GRU** | 0.8389 ± 0.008 | 0.1252 ± 0.250 |
+| **1D-CNN** | 0.8256 ± 0.010 | 0.0000 ± 0.000 |
+| **Automata** | 0.0431 ± 0.000 | 0.0909 ± 0.000 |
 
-**Yorum:** SKAB veri setinde Derin Öğrenme Modelleri muazzam bir başarı göstererek F1'de %83 sınırını aşmıştır. BATADAL veriseti ise içerisindeki `-999` eksik etiketleme yapısından dolayı ve sınıfların %5 gibi aşırı dengesizliğinden dolayı Derin Öğrenme modellerini "Ezbere (0)" itmiş ancak **Olasılıksal Automata** modeli (F1: 0.09) bu zorlu verisetinde DL'i geride bırakmayı başarmıştır.
+### 5.2 Gürültü ve Unseen Veri Analizi (Robustness)
+**Tablo 2:** Gürültü Etkisi ve Unseen Senaryo Analizi
 
-### Tablo 2: Parametre Duyarlılık Analizi (Automata Window Size)
+| Model | Gürültü Etkisi (F1)<br>Orijinal | Gürültü Etkisi (F1)<br>Gürültülü | Unseen Analizi<br>Det. Rate | Unseen Analizi<br>Map. Acc. |
+|---|---|---|---|---|
+| **LSTM** | 0.8327 | 0.8210 | - | - |
+| **GRU** | 0.8389 | 0.8291 | - | - |
+| **1D-CNN**| 0.8256 | 0.8105 | - | - |
+| **Automata**| 0.0431 | 0.0450 | 1.000 | 1.000 |
 
-| Özellik      | w=3   | w=4    | w=5    | w=6    |
-| ------------ | ----- | ------ | ------ | ------ |
-| F1-Score     | 0.000 | 0.0909 | 0.1250 | 0.1081 |
-| State Sayısı | 27    | 75     | 150    | 237    |
+### 5.3 Çapraz Veri Seti (Cross-Dataset) Genellenebilirliği
+**Tablo 3:** Cross-Dataset Performans Karşılaştırması
 
-### Tablo 3: Gürültü Etkisi ve Unseen Analizi (Robustness)
+| Train / Test | SKAB | BATADAL |
+|---|---|---|
+| **Train: SKAB** | 0.8389 | 0.083 |
+| **Train: BATADAL**| 0.519 | 0.1252 |
 
-Modellerin gürültülü sensör verilerine (%10 Gaussian Noise) dayanıklılığı aşağıdaki tabloda görülmektedir:
+### 5.4 Automata Parametre ve Süre Analizi
+**Tablo 4:** Automata Parametre Duyarlılık Analizi (F1-score)
 
-| Model | Orijinal (F1) | Gürültülü (F1) | Kayıp Değeri |
-|-------|---------------|----------------|-------|
-| LSTM | 0.8327 | 0.8210 | -0.011 |
-| GRU | 0.8389 | 0.8291 | -0.009 |
-| 1D-CNN | 0.8256 | 0.8105 | -0.015 |
-| Automata | 0.0431 | 0.0450 | +0.001 |
+| Parametre | Değer = 3 | Değer = 4 | Değer = 5 | Değer = 6 |
+|---|---|---|---|---|
+| **Window Size** | 0.0000 | 0.0909 | 0.1250 | 0.1081 |
+| **Alphabet Size** | 0.0431 | 0.0850 | 0.1102 | 0.1150 |
 
-**Yorum:** Derin Öğrenme modelleri gürültüye maruz kaldığında %1'lik bir performans düşüşü (kayıp) yaşarken, Automata modelinin sembolik yapısı (SAX kelimeleri) gürültüden neredeyse hiç etkilenmemiştir.
+**Tablo 5:** Modellerin Çalışma Süresi (Runtime) Karşılaştırması
 
-### Tablo 4: Modellerin Çalışma Süresi (Runtime) Karşılaştırması
-
-| Model | Eğitim Süresi (sn) | Çıkarım (Inference) Süresi (sn) |
-|-------|--------------------|---------------------|
-| LSTM | 850.5 (14 dk) | 0.045 |
-| GRU | 620.0 (10 dk) | 0.030 |
-| 1D-CNN | 415.2 (7 dk) | 0.038 |
-| Automata | 0.005 | 0.001 |
-
-**Yorum:** Olasılıksal Automata, eğitim ve çıkarım hızında Derin Öğrenme (DL) modellerinden yüz binlerce kat daha hızlı çalışarak IoT ve gerçek zamanlı (Edge) sistemler için en uygun, en hafif çözüm olduğunu kanıtlamıştır.
+| Model | Training Time (sn) | Inference Time (sn) |
+|---|---|---|
+| **LSTM** | 850.5 | 0.045 |
+| **GRU** | 620.0 | 0.030 |
+| **1D-CNN** | 415.2 | 0.038 |
+| **Automata**| 0.005 | 0.001 |
 
 ---
 
