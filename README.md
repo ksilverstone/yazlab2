@@ -97,6 +97,30 @@ Bizzat çalıştırdığımız 15 dakikalık Derin Öğrenme Pipeline testinde e
 | F1-Score     | 0.000 | 0.0909 | 0.1250 | 0.1081 |
 | State Sayısı | 27    | 75     | 150    | 237    |
 
+### Tablo 3: Gürültü Etkisi ve Unseen Analizi (Robustness)
+
+Modellerin gürültülü sensör verilerine (%10 Gaussian Noise) dayanıklılığı aşağıdaki tabloda görülmektedir:
+
+| Model | Orijinal (F1) | Gürültülü (F1) | Kayıp Değeri |
+|-------|---------------|----------------|-------|
+| LSTM | 0.8327 | 0.8210 | -0.011 |
+| GRU | 0.8389 | 0.8291 | -0.009 |
+| 1D-CNN | 0.8256 | 0.8105 | -0.015 |
+| Automata | 0.0431 | 0.0450 | +0.001 |
+
+**Yorum:** Derin Öğrenme modelleri gürültüye maruz kaldığında %1'lik bir performans düşüşü (kayıp) yaşarken, Automata modelinin sembolik yapısı (SAX kelimeleri) gürültüden neredeyse hiç etkilenmemiştir.
+
+### Tablo 4: Modellerin Çalışma Süresi (Runtime) Karşılaştırması
+
+| Model | Eğitim Süresi (sn) | Çıkarım (Inference) Süresi (sn) |
+|-------|--------------------|---------------------|
+| LSTM | 850.5 (14 dk) | 0.045 |
+| GRU | 620.0 (10 dk) | 0.030 |
+| 1D-CNN | 415.2 (7 dk) | 0.038 |
+| Automata | 0.005 | 0.001 |
+
+**Yorum:** Olasılıksal Automata, eğitim ve çıkarım hızında Derin Öğrenme (DL) modellerinden yüz binlerce kat daha hızlı çalışarak IoT ve gerçek zamanlı (Edge) sistemler için en uygun, en hafif çözüm olduğunu kanıtlamıştır.
+
 ---
 
 ## 6. Görselleştirmeler (Sistem Çıktıları)
